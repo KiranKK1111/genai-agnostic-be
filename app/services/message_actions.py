@@ -1,0 +1,136 @@
+"""Message action handlers — edit, retry, resend, copy content, like, dislike."""
+import json
+import logging
+from app.database import get_pool
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+async def react_to_message(message_id: str, reaction: str | None, comment: str = None) -> dict:
+    """Like/dislike a message. Pass None to clear reaction (toggle).
+    Returns {status, reaction}."""
+    settings = get_settings()
+    pool = get_pool()
+    schema = settings.APP_SCHEMA
+
+    async with pool.acquire() as conn:
+        # Check current reaction (for toggle behavior)
+        current = await conn.fetchrow(
+            f"SELECT reaction FROM {schema}.chat_messages WHERE id=$1::uuid", message_id
+        )
+        if not current:
+            raise ValueError("Message not found")
+
+        # Toggle: same reaction again -> clear it
+        final_reaction = None if current["reaction"] == reaction else reaction
+
+        await conn.execute(
+            f"UPDATE {schema}.chat_messages SET reaction=$1, reaction_comment=$2 WHERE id=$3::uuid",
+            final_reaction, comment, message_id
+        )
+
+        # Also write to feedback table for admin analysis
+        if final_reaction:
+            try:
+                msg_full = await conn.fetchrow(
+                    f"""SELECT session_id, content_sql, metadata->'intent' as intent
+                        FROM {schema}.chat_messages WHERE id=$1::uuid""",
+                    message_id
+                )
+                rating = 1 if final_reaction == "like" else -1
+                await conn.execute(
+                    f"""INSERT INTO {schema}.feedback
+                        (user_id, session_id, message_id, rating, feedback_text,
+                         intent_at_time, generated_sql_at_time)
+                        VALUES ($1, $2, $3::uuid, $4, $5, $6, $7)""",
+                    "local",
+                    str(msg_full["session_id"]) if msg_full else None,
+                    message_id,
+                    rating,
+                    comment,
+                    str(msg_full["intent"]) if msg_full and msg_full["intent"] else None,
+                    msg_full["content_sql"] if msg_full else None,
+                )
+            except Exception as e:
+                logger.debug(f"Feedback write skipped: {e}")
+
+    return {"status": "ok", "reaction": final_reaction}
+
+
+async def edit_user_message(message_id: str, new_content: str) -> dict:
+    """Edit a user message: deactivate all downstream, prepare for re-processing.
+    Returns {session_id, original_content, deactivated_count}."""
+    settings = get_settings()
+    pool = get_pool()
+    schema = settings.APP_SCHEMA
+
+    async with pool.acquire() as conn:
+        # Get the message
+        msg = await conn.fetchrow(
+            f"SELECT * FROM {schema}.chat_messages WHERE id=$1::uuid", message_id
+        )
+        if not msg:
+            raise ValueError("Message not found")
+        if msg["role"] != "user":
+            raise ValueError("Can only edit user messages")
+
+        # Update the message content
+        await conn.execute(
+            f"UPDATE {schema}.chat_messages SET content=$1 WHERE id=$2::uuid",
+            new_content, message_id
+        )
+
+        # Deactivate all messages after this one in the same session
+        result = await conn.execute(
+            f"""UPDATE {schema}.chat_messages SET is_active=false
+                WHERE session_id=$1 AND created_at > $2 AND is_active=true""",
+            msg["session_id"], msg["created_at"]
+        )
+
+        # Count deactivated
+        count_str = result.split()[-1] if result else "0"
+        try:
+            deactivated = int(count_str)
+        except ValueError:
+            deactivated = 0
+
+        # Rollback session state using snapshot
+        if msg.get("session_snapshot"):
+            from app.services.session import SessionManager
+            sm = SessionManager()
+            state = await sm.get_or_create(str(msg["session_id"]))
+            snapshot = json.loads(msg["session_snapshot"]) if isinstance(msg["session_snapshot"], str) else msg["session_snapshot"]
+            state.update(snapshot)
+            await sm.save(state)
+
+    return {
+        "session_id": str(msg["session_id"]),
+        "original_content": msg["content"],
+        "deactivated_count": deactivated,
+    }
+
+
+async def get_message_content(message_id: str, format: str = "raw") -> str:
+    """Get message content in a specific format for copy."""
+    settings = get_settings()
+    pool = get_pool()
+    schema = settings.APP_SCHEMA
+
+    async with pool.acquire() as conn:
+        msg = await conn.fetchrow(
+            f"SELECT content, content_sql, metadata FROM {schema}.chat_messages WHERE id=$1::uuid",
+            message_id
+        )
+        if not msg:
+            raise ValueError("Message not found")
+
+    if format == "sql" and msg["content_sql"]:
+        return msg["content_sql"]
+    elif format == "markdown":
+        return msg["content"]
+    elif format == "json":
+        meta = msg["metadata"] if isinstance(msg["metadata"], dict) else json.loads(msg["metadata"] or "{}")
+        return json.dumps({"content": msg["content"], "sql": msg["content_sql"], "metadata": meta}, indent=2, default=str)
+    else:
+        return msg["content"]
