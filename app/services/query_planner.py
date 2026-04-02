@@ -112,7 +112,7 @@ async def _ground_value_full(value: str, plan_tables: list[str], schema_graph: S
     try:
         from app.services.vector_search import ground_value
         faiss_results = await ground_value(value, k=3)
-        if faiss_results and faiss_results[0]["similarity"] > 0.80:
+        if faiss_results and faiss_results[0]["similarity"] > settings.FAISS_VALUE_SIMILARITY:
             best = faiss_results[0]
             logger.info(f"Value grounding (FAISS): '{value}' -> '{best['value']}' (similarity={best['similarity']:.2f})")
             return best["value"], best.get("table"), best.get("column")
@@ -163,7 +163,7 @@ async def _ground_value_full(value: str, plan_tables: list[str], schema_graph: S
                 if not isinstance(cval, str):
                     continue
                 score = fuzz.ratio(val_lower, cval.lower())
-                if score > best_score and score >= 75:
+                if score > best_score and score >= settings.FUZZY_MATCH_THRESHOLD:
                     best_score = score
                     best_match = (cval, tname, cname)
 
@@ -287,6 +287,24 @@ def _spacy_extract(text: str, schema_graph: SchemaGraph) -> dict:
     if limit_match:
         limit = int(limit_match.group(1))
 
+    # Normalize numeric shorthands in filter values (e.g. "50k" → 50000, "2M" → 2000000)
+    normalized_filters = []
+    for fv in filter_values:
+        norm_match = re.match(r'^(\d+(?:\.\d+)?)\s*([kKmMbBcCrR]|cr|lakh|lakhs|crore|crores)$', fv.strip())
+        if norm_match:
+            num = float(norm_match.group(1))
+            suffix = norm_match.group(2).lower()
+            multipliers = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000,
+                           "c": 10_000_000, "cr": 10_000_000, "crore": 10_000_000, "crores": 10_000_000,
+                           "r": 100_000, "lakh": 100_000, "lakhs": 100_000}
+            multiplier = multipliers.get(suffix, 1)
+            expanded = int(num * multiplier)
+            normalized_filters.append(str(expanded))
+            logger.info(f"Stage 1: normalized '{fv}' -> {expanded}")
+        else:
+            normalized_filters.append(fv)
+    filter_values = normalized_filters
+
     result = {}
     if table_hints:
         result["table_hints"] = table_hints
@@ -316,28 +334,95 @@ async def build_query_plan(user_message: str, schema_graph: SchemaGraph, session
 
     # Second pass: LLM extraction (fills gaps spaCy missed)
     synonyms_display = {syn: tbl for syn, tbl in schema_graph.synonyms.items() if syn != tbl}
+
+    # Build domain-aware table descriptions for the LLM
+    table_descriptions = {}
+    for tname, tmeta in schema_graph.tables.items():
+        desc_parts = []
+        if tmeta.description:
+            desc_parts.append(tmeta.description)
+        cols = list(tmeta.columns.keys())[:10]
+        desc_parts.append(f"columns: {', '.join(cols)}")
+        table_descriptions[tname] = ". ".join(desc_parts)
+
+    # Load semantic expansions if available (generated during seeding)
+    semantic_hints = ""
+    try:
+        from app.database import get_pool
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            cached = await conn.fetchrow(
+                f"SELECT description FROM {settings.APP_SCHEMA}.schema_index "
+                f"WHERE table_name = '_semantic_expansions' AND column_name IS NULL"
+            )
+            if cached and cached["description"]:
+                expansions = json.loads(cached["description"])
+                # Format: "balance → money, funds, wealth"
+                expansion_lines = []
+                for key, terms in expansions.items():
+                    if isinstance(terms, list) and terms:
+                        flat = [str(t) for t in terms if not isinstance(t, (list, dict))]
+                        if flat:
+                            expansion_lines.append(f"  {key} → {', '.join(flat[:5])}")
+                if expansion_lines:
+                    semantic_hints = "\nSemantic mappings (use these to resolve conceptual queries):\n" + "\n".join(expansion_lines[:30])
+    except Exception:
+        pass
+
+    tables_info = "\n".join(f"  {t}: {d}" for t, d in table_descriptions.items())
+
     extract_prompt = f"""Analyze this database query and extract entities.
-Available tables: {', '.join(schema_graph.tables.keys())}
+
+Available tables and their descriptions:
+{tables_info}
+
 Known synonyms: {json.dumps(synonyms_display)}
+{semantic_hints}
 
 User query: "{user_message}"
 
 Rules:
-- ONLY map user terms to tables if they exactly match a table name or a known synonym above
-- Do NOT infer table mappings based on general knowledge (e.g. do NOT map "buyers" to "customers" unless "buyers" is a known synonym)
-- If a term does not match any table or synonym, do NOT include it in table_hints
-- Include unrecognized terms in filter_values instead
+- Map user terms to tables using table names, known synonyms, descriptions, OR semantic mappings above
+- Use the table descriptions and semantic mappings to resolve conceptual queries
+  (e.g. if user says "money" and semantic mappings show "balance → money, funds", map to the table containing balance)
+- If a term matches a semantic mapping, include the corresponding table in table_hints
+- Include filter values (specific names, places, dates, numbers) in filter_values
+- If the user asks about a concept that maps to a specific column via semantic mappings, include the column in order_by if relevant
+
+CRITICAL — table_hints must include ALL tables needed to answer the query:
+Step 1: Identify the primary entity (what the user wants to see)
+Step 2: Think about what OTHER tables are needed to satisfy the query.
+  - If the query references a relationship between entities, include all related tables
+  - "account holders" = customers who have accounts → needs customers + accounts
+  - "credit card transactions" = transactions done via credit cards → needs transactions + cards
+  - "customers with loans" = needs customers + loans
+Step 3: Include all identified tables in table_hints
+Step 4: If a term acts as BOTH a table reference AND a qualifier/filter, include it in BOTH
+  table_hints and filter_values.
+  - "credit card transactions" → table_hints: ["transactions", "cards"], filter_values: ["credit"]
+    (because "credit" qualifies the card_type)
+  - "personal loans" → table_hints: ["loans"], filter_values: ["personal"]
+  - "savings accounts" → table_hints: ["accounts"], filter_values: ["savings"]
 
 Return JSON only:
 {{"table_hints": ["matched table names"],
+  "primary_entity": "the table whose DATA the user wants to see (not tables used only for filtering/joining)",
   "filter_values": ["values to filter by"],
   "aggregation": "count|sum|avg|min|max|none",
   "order_by": "column name or null",
   "limit": null or number}}
 
+primary_entity rules:
+- This is the table whose rows/details the user wants to RETRIEVE
+- Example: "get me all account holders" → user wants CUSTOMER details, so primary_entity = "customers" (not "accounts")
+- Example: "show me all loans in AP" → user wants LOAN details, so primary_entity = "loans"
+- Example: "customers who have credit cards" → user wants CUSTOMER details, so primary_entity = "customers"
+
 Aggregation rules:
-- Use "count" ONLY when the user explicitly asks "how many", "count", or "number of"
-- Use "none" when the user says "show", "list", "display", "get", "find", "fetch", or "all" — these mean return rows, not a count"""
+- Use "count" ONLY when the user is explicitly asking for a NUMBER/COUNT (e.g. "how many", "count of", "number of", "total count")
+- Use "none" for ALL other cases — especially when the user wants to SEE/RETRIEVE data
+- "get me all X", "show all X", "list all X", "fetch all X", "display X" → aggregation MUST be "none"
+- When in doubt, use "none" — it is better to return data rows than an unwanted count"""
 
     llm_entities = await chat_json([{"role": "user", "content": extract_prompt}])
 
@@ -349,51 +434,89 @@ Aggregation rules:
     if spacy_entities.get("filter_values"):
         existing = set(entities.get("filter_values", []))
         entities["filter_values"] = list(existing | set(spacy_entities["filter_values"]))
+    # Deduplicate filter values (case-insensitive) — keep the first occurrence's casing
+    if entities.get("filter_values"):
+        seen = set()
+        deduped = []
+        for fv in entities["filter_values"]:
+            key = fv.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(fv)
+        entities["filter_values"] = deduped
+    # Normalize any numeric shorthands in merged filter values
+    if entities.get("filter_values"):
+        _norm = []
+        for fv in entities["filter_values"]:
+            nm = re.match(r'^(\d+(?:\.\d+)?)\s*([kKmMbBcCrR]|cr|lakh|lakhs|crore|crores)$', fv.strip())
+            if nm:
+                num = float(nm.group(1))
+                suffix = nm.group(2).lower()
+                mults = {"k": 1_000, "m": 1_000_000, "b": 1_000_000_000,
+                         "c": 10_000_000, "cr": 10_000_000, "crore": 10_000_000, "crores": 10_000_000,
+                         "r": 100_000, "lakh": 100_000, "lakhs": 100_000}
+                _norm.append(str(int(num * mults.get(suffix, 1))))
+            else:
+                _norm.append(fv)
+        entities["filter_values"] = _norm
     if spacy_entities.get("aggregation") and entities.get("aggregation", "none") == "none":
         entities["aggregation"] = spacy_entities["aggregation"]
 
-    # Deterministic override: "show all", "list", "display" etc. should never be count
+    # Safety override: if the LLM returned "count" but the user clearly wants to
+    # retrieve/list data (not count it), correct it. The user must explicitly ask
+    # for a count — ambiguous cases default to listing rows.
     msg_lower = user_message.lower()
-    if entities.get("aggregation") == "count" and not any(
-        kw in msg_lower for kw in ["how many", "count", "number of", "total number"]
-    ):
-        if re.search(r"\b(show|list|display|get|find|fetch|retrieve|give)\b", msg_lower):
-            entities["aggregation"] = "none"
+    explicitly_counting = any(kw in msg_lower for kw in ["how many", "count of", "number of", "total number", "total count"])
+    if entities.get("aggregation") == "count" and not explicitly_counting:
+        logger.info(f"Stage 1: overriding aggregation 'count' → 'none' (no explicit count keywords in message)")
+        entities["aggregation"] = "none"
     if spacy_entities.get("order_by") and not entities.get("order_by"):
         entities["order_by"] = spacy_entities["order_by"]
     if spacy_entities.get("limit") and not entities.get("limit"):
         entities["limit"] = spacy_entities["limit"]
 
-    # Validate table_hints: only keep hints that trace back to a word or phrase in the user's message
-    # via exact table name, known synonym, or plural/singular match
+    # Validate table_hints: keep hints that trace back to user's message
+    # via exact name, synonym, plural/singular, OR semantic expansion
     validated_hints = []
     msg_tokens = {w.lower() for w in re.findall(r"\w+", user_message)}
-    # Build bigrams from message for multi-word synonym matching (e.g. "account holders" -> "account_holders")
     msg_words = [w.lower() for w in re.findall(r"\w+", user_message)]
     msg_bigrams = {f"{msg_words[i]}_{msg_words[i+1]}" for i in range(len(msg_words) - 1)}
 
+    # Load semantic expansions for validation
+    semantic_expansion_map: dict[str, set[str]] = {}
+    try:
+        from app.database import get_pool as _get_pool
+        _pool = _get_pool()
+        import asyncio
+        async with _pool.acquire() as _conn:
+            _cached = await _conn.fetchrow(
+                f"SELECT description FROM {settings.APP_SCHEMA}.schema_index "
+                f"WHERE table_name = '_semantic_expansions' AND column_name IS NULL"
+            )
+            if _cached and _cached["description"]:
+                _expansions = json.loads(_cached["description"])
+                for key, terms in _expansions.items():
+                    table_name = key.split(".")[0]  # "accounts.balance" → "accounts"
+                    if isinstance(terms, list):
+                        for term in terms:
+                            if isinstance(term, (list, dict)):
+                                continue
+                            for word in str(term).lower().split():
+                                semantic_expansion_map.setdefault(word, set()).add(table_name)
+    except Exception:
+        pass
+
     for hint in entities.get("table_hints", []):
         hint_lower = hint.lower()
-        # Direct: user said the table name or its singular/plural
-        if hint_lower in msg_tokens or hint_lower.rstrip("s") in msg_tokens or hint_lower + "s" in msg_tokens:
+        # Validate: the table must exist in the schema (reject hallucinated tables)
+        if hint_lower in schema_graph.tables:
             validated_hints.append(hint)
             continue
-        # Reverse synonym: check if any user token is a known synonym for this table
-        found = False
-        for token in msg_tokens:
-            resolved = schema_graph.resolve_table(token)
-            if resolved == hint_lower:
-                validated_hints.append(hint)
-                found = True
-                break
-        if found:
+        # Try resolving as a synonym
+        resolved = schema_graph.resolve_table(hint_lower)
+        if resolved and resolved in schema_graph.tables:
+            validated_hints.append(resolved)
             continue
-        # Reverse synonym on bigrams: check multi-word phrases (e.g. "account_holders")
-        for bigram in msg_bigrams:
-            resolved = schema_graph.resolve_table(bigram)
-            if resolved == hint_lower:
-                validated_hints.append(hint)
-                break
     if len(validated_hints) != len(entities.get("table_hints", [])):
         rejected = set(entities.get("table_hints", [])) - set(validated_hints)
         logger.info(f"Stage 1 rejected ungrounded table hints: {rejected}")
@@ -434,24 +557,16 @@ Aggregation rules:
             plan.tables.append(resolved)
 
     # ── Stage 2a-ii: Primary table detection ──────────────
-    # The table the user wants to SEE (subject of show/list/get) should be first.
-    # Tables used only for filtering (in subordinate clauses) go after.
+    # Use the LLM's primary_entity to determine which table the user wants data FROM.
+    # This table goes first in plan.tables so SELECT t1.* returns the right columns.
     if len(plan.tables) >= 2:
-        # Find the first resolved table noun after the action verb
-        # e.g. "show all the customers who are using credit cards" → primary = customers
-        subject_match = re.search(
-            r"\b(?:show|list|display|get|find|fetch|retrieve|give)\b"
-            r"(?:\s+(?:all|me|the|my|every|each|a))*"  # skip filler words
-            r"\s+(\w+)",              # the subject noun
-            msg_lower
-        )
-        if subject_match:
-            subject_word = subject_match.group(1)
-            subject_table = schema_graph.resolve_table(subject_word)
-            if subject_table and subject_table in plan.tables and plan.tables[0] != subject_table:
-                plan.tables.remove(subject_table)
-                plan.tables.insert(0, subject_table)
-                logger.info(f"Stage 2a: reordered primary table to '{subject_table}' (subject of user query)")
+        primary_hint = entities.get("primary_entity", "")
+        if primary_hint:
+            primary_table = schema_graph.resolve_table(primary_hint)
+            if primary_table and primary_table in plan.tables and plan.tables[0] != primary_table:
+                plan.tables.remove(primary_table)
+                plan.tables.insert(0, primary_table)
+                logger.info(f"Stage 2a: reordered primary table to '{primary_table}' (LLM primary_entity)")
 
     # ── Stage 2b: Value-implied table discovery ────────────
     # Only discover additional tables if we already have at least one table from Stage 2a.
@@ -543,7 +658,48 @@ Aggregation rules:
     # (Columns resolved during value grounding and SQL generation)
 
     # ── Stage 5: Value grounding (full 3-tier) ─────────────
+    # Check for pre-resolved ambiguities from session state
+    resolved_ambiguities = session_state.get("resolved_ambiguities", []) if session_state else []
+    resolved_map = {}  # token -> (table, column)
+    for ra in resolved_ambiguities:
+        token = ra.get("token", "").lower()
+        resolved_ref = ra.get("resolved", "")
+        if token and "." in resolved_ref:
+            rt, rc = resolved_ref.split(".", 1)
+            resolved_map[token] = (rt, rc)
+
     for val in entities.get("filter_values", []):
+        # If this value was already resolved by a clarification, use the resolved column directly
+        if val.lower() in resolved_map:
+            res_table, res_column = resolved_map[val.lower()]
+            # Ground the actual value in the resolved column
+            grounded_value = val
+            # Look up the actual DB value
+            actual = schema_graph.lookup_value(val, [res_table])
+            if actual:
+                grounded_value = actual[0]
+            else:
+                # Try case-insensitive match from value index
+                from app.database import get_pool
+                try:
+                    pool = get_pool()
+                    async with pool.acquire() as conn:
+                        row = await conn.fetchrow(
+                            f"SELECT {res_column} FROM {settings.POSTGRES_SCHEMA}.{res_table} WHERE {res_column} ILIKE $1 LIMIT 1",
+                            f"%{val}%"
+                        )
+                        if row:
+                            grounded_value = row[res_column]
+                except Exception:
+                    pass
+            plan.filters.append({
+                "column": f"{res_table}.{res_column}",
+                "operator": "=",
+                "value": grounded_value,
+            })
+            logger.info(f"Stage 5: used resolved ambiguity for '{val}' → {res_table}.{res_column} = '{grounded_value}'")
+            continue
+
         grounded_value, grounded_table, grounded_column = await _ground_value_full(val, plan.tables, schema_graph)
 
         # If grounding found the table and column, use them directly
@@ -583,6 +739,29 @@ Aggregation rules:
                 if matched:
                     break
 
+    # ── Stage 5b: Remove unnecessary JOINed tables ─────────
+    # After value grounding, check if any non-primary table is actually needed.
+    # A JOINed table is unnecessary if no filter references it.
+    if len(plan.tables) >= 2:
+        filter_tables = set()
+        for f in plan.filters:
+            col = f.get("column", "")
+            if "." in col:
+                filter_tables.add(col.split(".")[0])
+        primary = plan.tables[0]
+        needed_tables = [primary]
+        for t in plan.tables[1:]:
+            if t in filter_tables:
+                needed_tables.append(t)
+            else:
+                logger.info(f"Stage 5b: removed unnecessary table '{t}' (no filters reference it)")
+        if len(needed_tables) != len(plan.tables):
+            plan.tables = needed_tables
+            # Also clean up joins that reference removed tables
+            plan.joins = [j for j in plan.joins if all(
+                t in needed_tables for t in [j.get("left_table", ""), j.get("right_table", "")]
+            )] if plan.joins else []
+
     # ── Stage 6: Aggregation, ordering & limit ─────────────
     agg = entities.get("aggregation", "none")
     if agg and agg != "none":
@@ -617,13 +796,15 @@ async def generate_sql(plan: QueryPlan, schema: str, schema_graph=None) -> str:
     else:
         select_clause = "SELECT *"
 
-    # Only include column names for joined/filter tables (not primary) to keep prompt small
+    # Include column names + table descriptions for domain-aware SQL generation
     column_hint = ""
-    if schema_graph and has_joins:
-        for tname in plan.tables[1:]:
+    if schema_graph:
+        for tname in plan.tables:
             if tname in schema_graph.tables:
-                cols = list(schema_graph.tables[tname].columns.keys())
-                column_hint += f"\n{tname} columns: {', '.join(cols)}"
+                tmeta = schema_graph.tables[tname]
+                cols = list(tmeta.columns.keys())
+                desc = f" — {tmeta.description}" if tmeta.description else ""
+                column_hint += f"\n{tname}{desc}\n  columns: {', '.join(cols)}"
 
     select_instruction = f"IMPORTANT: The SELECT clause MUST be exactly: {select_clause} (where t1 is the alias for '{primary_table}'). Do NOT list individual columns." if select_clause else ""
 
@@ -631,7 +812,10 @@ async def generate_sql(plan: QueryPlan, schema: str, schema_graph=None) -> str:
 Schema: {schema}
 Plan: {plan_json}
 {select_instruction}
-Rules: SELECT only. Prefix tables with {schema}. Use unique lowercase aliases. Use exact column/table names from plan. No SQL comments.{column_hint}"""
+
+Table context:{column_hint}
+
+Rules: SELECT only. Prefix tables with {schema}. Use unique lowercase aliases. Use exact column/table names from plan. No SQL comments."""
 
     sql = await chat([{"role": "user", "content": prompt}], temperature=0.1)
     return _extract_sql(sql)
@@ -775,21 +959,55 @@ async def amend_sql(original_sql: str, follow_up: str, plan: QueryPlan, schema_g
         return amended
 
     # ── Pass 2: LLM amendment ──────────────────────────────
-    # Only include tables already referenced in the original SQL
+    # Include tables already referenced in the SQL
     referenced_tables = {}
     for tname, tmeta in schema_graph.tables.items():
         if tname in original_sql.lower():
             referenced_tables[tname] = list(tmeta.columns.keys())
 
-    # Get actual distinct values from the DB for referenced tables
+    # Also discover related tables that might be needed for the follow-up.
+    # The follow-up may reference entities in other tables (e.g. "personal loans"
+    # requires JOINing the loans table even though the original query is on customers).
+    related_tables = {}
+    for tname, tmeta in schema_graph.tables.items():
+        if tname in referenced_tables:
+            continue
+        # Check if any word in the follow-up maps to this table or its columns
+        for word in re.findall(r"[A-Za-z_]+", follow_up.lower()):
+            if len(word) < 3:
+                continue
+            resolved_table = schema_graph.resolve_table(word)
+            if resolved_table == tname:
+                related_tables[tname] = list(tmeta.columns.keys())
+                break
+            for cname in tmeta.columns:
+                if word in cname or cname in word:
+                    related_tables[tname] = list(tmeta.columns.keys())
+                    break
+            if tname in related_tables:
+                break
+
+    all_tables = {**referenced_tables, **related_tables}
+
+    # Get actual distinct values from the DB for all relevant tables
     # so the LLM can map user terms to real values (e.g. "Visakhapatnam" -> "Vizag")
-    column_values = schema_graph.get_column_values(list(referenced_tables.keys()))
+    column_values = schema_graph.get_column_values(list(all_tables.keys()))
+
+    # Extract schema prefix from original SQL for consistency
+    schema_prefix = ""
+    schema_match = re.search(r"FROM\s+(\w+)\.", original_sql, re.IGNORECASE)
+    if schema_match:
+        schema_prefix = schema_match.group(1)
+
+    related_section = ""
+    if related_tables:
+        related_section = f"\nRelated tables (JOIN if needed): {json.dumps(related_tables, default=str)}"
 
     prompt = f"""Amend this SQL query based on the follow-up question.
 
 Original SQL: {original_sql}
 Follow-up: "{follow_up}"
-Tables and columns: {json.dumps(referenced_tables, default=str)}
+Tables in current query: {json.dumps(referenced_tables, default=str)}{related_section}
 
 ACTUAL values in the database (use ONLY these values in WHERE clauses):
 {json.dumps(column_values, indent=2, default=str)}
@@ -798,10 +1016,12 @@ Rules:
 - CRITICAL: Only generate SELECT queries
 - CRITICAL: Do NOT include SQL comments (-- or /* */)
 - CRITICAL: Only use values from the ACTUAL values list above. Map user terms to the closest matching actual value (e.g. if user says "Visakhapatnam" but actual values have "Vizag", use "Vizag")
-- Preserve the schema prefix on all table names exactly as in the original SQL
-- Start from the original SQL and modify what's necessary to address the follow-up
-- If the user asks to "summarize by", "group by", "break down by", or "for each", restructure the SELECT to include the grouping column and add a GROUP BY clause
-- Do NOT add JOINs unless the follow-up explicitly asks for data from another table
+- CRITICAL: PRESERVE all existing WHERE conditions from the original SQL unless the user explicitly asks to remove or change them. The follow-up ADDS to or refines the existing query
+- If the user says "get all", "list all", "show all" etc., change SELECT to return rows (SELECT *) not COUNT(*). Keep the existing filters and JOINs unless the user says to remove them
+- If the original has COUNT(*) and the user asks to "list" or "show" or "get" records, change to SELECT *
+- Preserve the schema prefix ({schema_prefix}) on all table names exactly as in the original SQL
+- Start from the original SQL and modify only what is necessary to address the follow-up
+- If the follow-up references data from a related table, add a JOIN using the appropriate foreign key
 - Return ONLY the amended SQL, no explanation"""
 
     amended = await chat([{"role": "user", "content": prompt}], temperature=0.1)

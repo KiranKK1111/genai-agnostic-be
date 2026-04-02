@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import create_pool, close_pool, get_pool
-from app.startup_validator import validate_startup
+from app.startup_validator import validate_startup, is_llm_available
 from app.services.schema_inspector import inspect_schema
 from app.orchestrator import set_schema_graph
 from app.api import chat, auth, admin
@@ -67,37 +67,39 @@ async def lifespan(app: FastAPI):
     set_schema_graph(graph)
     logger.info(f"  ✓ Schema loaded: {len(graph.tables)} tables")
 
-    # Load existing FAISS indexes from PostgreSQL (persists across restarts)
-    logger.info("Loading FAISS indexes from PostgreSQL...")
-    from app.services.faiss_manager import load_all_indexes, get_faiss_index
-    await load_all_indexes()
-
-    # Only seed if schema_idx is empty (first run or after manual reset)
-    schema_idx = await get_faiss_index("schema_idx")
-    if schema_idx.count == 0:
-        logger.info("Seeding FAISS vector indexes (first run)...")
-        from app.services.schema_seeder import seed_all
+    # Seed FAISS + BM25 indexes on every startup.
+    # The TF-IDF+SVD encoder is recomputed from scratch each time (no persisted weights),
+    # so stored vectors from a previous run would be in a different embedding space.
+    # Re-seeding ensures vectors and encoder are always in sync.
+    logger.info("Seeding FAISS + BM25 vector indexes...")
+    from app.services.faiss_manager import load_all_indexes, get_faiss_index, clear_index
+    from app.services.schema_seeder import seed_all
+    try:
         await seed_all(graph)
         logger.info("  ✓ FAISS indexes seeded (schema_idx + values_idx)")
-    else:
-        logger.info(f"  ✓ FAISS indexes already populated (schema_idx={schema_idx.count}, skipping seed)")
+    except Exception as e:
+        logger.error(f"  ✗ Seeding failed: {e}")
+        # Fallback: try to load stale vectors (better than nothing)
+        try:
+            await load_all_indexes()
+            logger.warning("  ⚠ Loaded stale vectors as fallback")
+        except Exception:
+            pass
+
+    # Run embedding evaluation (Stage 27) after seeding/loading
+    from app.services.embedding_eval import evaluate_retrieval
+    try:
+        eval_report = await evaluate_retrieval(graph, k=5)
+        recall = eval_report.get("recall_at_k", 0)
+        if recall < 0.5:
+            logger.warning(f"  ⚠ Embedding quality low: Recall@5={recall:.1%}")
+        else:
+            logger.info(f"  ✓ Embedding eval: Recall@5={recall:.1%}, MRR={eval_report.get('mrr', 0):.3f}")
+    except Exception as e:
+        logger.debug(f"Embedding eval skipped: {e}")
 
     # Create upload directory
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
-
-    # Create default user if AUTH_ENABLED and no users exist
-    if settings.AUTH_ENABLED:
-        async with pool.acquire() as conn:
-            count = await conn.fetchval(f"SELECT COUNT(*) FROM {settings.APP_SCHEMA}.users")
-            if count == 0:
-                import bcrypt as _bcrypt
-                hashed = _bcrypt.hashpw("admin".encode(), _bcrypt.gensalt()).decode()
-                await conn.execute(
-                    f"""INSERT INTO {settings.APP_SCHEMA}.users (username, email, hashed_password, role)
-                        VALUES ('admin', 'admin@local', $1, 'admin')""",
-                    hashed
-                )
-                logger.info("  ✓ Default admin user created (username: admin, password: admin)")
 
     # Start schema watcher background task
     from app.services.schema_watcher import start_watcher
@@ -106,7 +108,11 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
     logger.info(f"Server ready at http://localhost:8000")
     logger.info(f"Database: {settings.POSTGRES_SCHEMA} ({len(graph.tables)} tables)")
-    logger.info(f"LLM: {settings.AI_FACTORY_MODEL} via Ollama")
+    if is_llm_available():
+        logger.info(f"LLM: {settings.AI_FACTORY_MODEL} via Ollama")
+    else:
+        logger.warning(f"LLM: UNAVAILABLE — start Ollama and pull {settings.AI_FACTORY_MODEL}")
+    logger.info(f"Embeddings: local SentenceEncoder ({settings.EMBEDDING_DIMENSIONS}d, no external model)")
     logger.info(f"Auth: {'enabled' if settings.AUTH_ENABLED else 'disabled (local mode)'}")
     logger.info("=" * 60)
 
@@ -126,6 +132,18 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# Request logging middleware (Issue #11)
+import time as _time
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    start = _time.time()
+    response = await call_next(request)
+    elapsed = (_time.time() - start) * 1000
+    if not request.url.path.startswith("/docs") and not request.url.path.startswith("/openapi"):
+        logger.info(f"{request.method} {request.url.path} {response.status_code} {elapsed:.0f}ms")
+    return response
 
 # CORS
 settings = get_settings()

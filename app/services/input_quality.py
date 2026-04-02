@@ -7,6 +7,25 @@ from collections import Counter
 logger = logging.getLogger(__name__)
 
 # Common English words for dictionary check
+# ── Named Constants ──────────────────────────────────────
+# Signal thresholds (tuned empirically)
+ENTROPY_THRESHOLD = 4.5        # Above this = high entropy (random characters)
+DICT_RATIO_THRESHOLD = 0.3     # Below this = few recognizable English words
+VOWEL_LOW = 0.15               # Below this = consonant-heavy (likely gibberish)
+VOWEL_HIGH = 0.75              # Above this = vowel-heavy (likely gibberish)
+REPEAT_THRESHOLD = 0.5         # Above this = excessive character repetition
+KEYBOARD_ADJ_THRESHOLD = 0.6   # Above this = keyboard mashing pattern
+LANG_MIN_LENGTH = 15           # Min text length to run language detection
+LANG_CONFIDENCE_THRESHOLD = 0.4  # Below this = not a recognizable language
+
+# Signal weights (must sum to ~1.0)
+W_ENTROPY = 0.25
+W_DICT = 0.30
+W_VOWEL = 0.10
+W_REPEAT = 0.10
+W_KEYBOARD = 0.15
+W_LANGUAGE = 0.10
+
 COMMON_WORDS = set("the be to of and a in that have i it for not on with he as you do at this but his by from they we say her she or an will my one all would there their what so up out if about who get which go me when make can like time no just him know take people into year your good some could them see other than then now look only come its over think also back after use two how our work first well way even new want because any these give day most us".split())
 KEYBOARD_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
 
@@ -84,6 +103,11 @@ def detect_gibberish(text: str) -> dict:
 
     text = text.strip()
 
+    # Quick SQL injection pattern check (supplement to prompt_guard)
+    _text_lower = text.lower()
+    if any(p in _text_lower for p in ["'; drop", "'; delete", "'; update", "1=1", "or 1=1", "union select"]):
+        return {"score": 1.0, "is_gibberish": True, "tier": "reject", "reason": "Suspicious SQL pattern"}
+
     # Short greetings are always OK
     if len(text) <= 10 and text.lower() in ["hi", "hello", "hey", "help", "thanks", "bye", "ok", "yes", "no"]:
         return {"score": 0.0, "is_gibberish": False, "tier": "pass", "reason": "Known greeting"}
@@ -97,23 +121,23 @@ def detect_gibberish(text: str) -> dict:
 
     # Signal 6: language detection (only for longer inputs to avoid noise)
     lang_conf = 0.0
-    if len(text) > 15:
+    if len(text) > LANG_MIN_LENGTH:
         lang_conf = _language_confidence(text)
 
-    # Weighted composite score (weights from architecture spec)
+    # Weighted composite score using named constants
     score = 0.0
-    if entropy > 4.5:
-        score += 0.25       # Signal 1 weight
-    if dict_ratio < 0.3:
-        score += 0.30       # Signal 2 weight
-    if vowel < 0.15 or vowel > 0.75:
-        score += 0.10       # Signal 3 weight
-    if repeat > 0.5:
-        score += 0.10       # Signal 4 weight
-    if kbd_adj > 0.6:
-        score += 0.15       # Signal 5 weight
-    if len(text) > 15 and lang_conf < 0.4:
-        score += 0.10       # Signal 6 weight
+    if entropy > ENTROPY_THRESHOLD:
+        score += W_ENTROPY
+    if dict_ratio < DICT_RATIO_THRESHOLD:
+        score += W_DICT
+    if vowel < VOWEL_LOW or vowel > VOWEL_HIGH:
+        score += W_VOWEL
+    if repeat > REPEAT_THRESHOLD:
+        score += W_REPEAT
+    if kbd_adj > KEYBOARD_ADJ_THRESHOLD:
+        score += W_KEYBOARD
+    if len(text) > LANG_MIN_LENGTH and lang_conf < LANG_CONFIDENCE_THRESHOLD:
+        score += W_LANGUAGE
 
     score = round(score, 3)
 

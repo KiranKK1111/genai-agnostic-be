@@ -36,8 +36,12 @@ FOLLOW-UP SUGGESTIONS:
 async def execute_chat(message: str, session_state: dict, user_name: str = "User"):
     """Execute the chat pipeline. Yields SSE events."""
     settings = get_settings()
-    domain_name = settings.POSTGRES_SCHEMA
-    system = SYSTEM_PROMPT.replace("{user_name}", user_name).replace("{domain_name}", domain_name)
+    # Derive a human-friendly domain name from the schema (e.g. "eds_banking" → "EDS Banking")
+    raw_schema = settings.POSTGRES_SCHEMA
+    domain_name = raw_schema.replace("_", " ").title()
+    # Use a display-friendly user name (avoid raw IDs like "8213167")
+    display_name = user_name if not user_name.isdigit() else "User"
+    system = SYSTEM_PROMPT.replace("{user_name}", display_name).replace("{domain_name}", domain_name)
 
     # Build messages: [compressed summary] + [last 5 turns] + [current message]
     messages = []

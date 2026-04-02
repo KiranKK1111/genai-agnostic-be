@@ -65,6 +65,7 @@ def viz_type_clarification(columns: list = None) -> dict:
     """Build viz type clarification payload (multi_select)."""
     return {
         "type": "viz_type", "mode": "multi_select",
+        "support_for_custom_replies": False,
         "question": "How would you like to view the data?",
         "options": [
             {"value": "table", "label": "Table", "icon": "\U0001f5c2\ufe0f"},
@@ -79,6 +80,7 @@ def axis_mode_clarification() -> dict:
     """Build axis mode clarification payload (single_select)."""
     return {
         "type": "axis_mode", "mode": "single_select",
+        "support_for_custom_replies": False,
         "question": "Do you want to select X-axis and Y-axis on the fly or want to be specific?",
         "options": [
             {"value": "on_the_fly", "label": "On the fly (interactive dropdowns)"},
@@ -103,13 +105,45 @@ def axis_specific_clarification(columns: list[dict]) -> dict:
 
 
 def record_limit_clarification(total_rows: int, limit: int) -> dict:
-    """Build record limit clarification payload (single_select)."""
-    return {
+    """Build record limit clarification payload (single_select).
+    When total_rows exceeds MAX_POPULATE_ROWS, the 'all' option is capped
+    and the question warns the user about display limitations."""
+    from app.config import get_settings
+    max_populate = get_settings().MAX_POPULATE_ROWS
+
+    note = None
+    if total_rows > max_populate:
+        question = (
+            f"This query matches **{total_rows:,} records**. "
+            f"How would you like to proceed?"
+        )
+        options = [
+            {"value": "all", "label": f"Load maximum ({max_populate:,} records)"},
+            {"value": "limited", "label": f"Load first {limit:,} records"},
+        ]
+        note = (
+            f"**Note:** Displaying all {total_rows:,} records at once may not be visually "
+            f"practical and could significantly slow down your browser. "
+            f"The maximum you can load on-screen is {max_populate:,} records. "
+            f"To access the full dataset, use the **Export** option after loading."
+        )
+    else:
+        question = (
+            f"This query returned **{total_rows:,} records**. "
+            f"How would you like to proceed?"
+        )
+        options = [
+            {"value": "all", "label": f"Load all {total_rows:,} records"},
+            {"value": "limited", "label": f"Load first {limit:,} records"},
+        ]
+
+    result = {
         "type": "record_limit", "mode": "single_select",
-        "question": f"The query returned {total_rows:,} records. How would you like to proceed?",
-        "options": [
-            {"value": "all", "label": f"Populate all {total_rows:,} records"},
-            {"value": "limited", "label": f"Populate first {limit:,} records"},
-        ],
-        "context": {"total_rows": total_rows, "limit": limit}
+        "support_for_custom_replies": True,
+        "question": question,
+        "options": options,
+        "context": {"total_rows": total_rows, "limit": limit, "max_populate": max_populate},
     }
+    if note:
+        result["note"] = note
+    return result

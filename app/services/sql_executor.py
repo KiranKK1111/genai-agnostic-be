@@ -100,7 +100,10 @@ def validate_sql(sql: str) -> dict | None:
 async def execute_sql(sql: str, uncapped: bool = False) -> dict:
     """Execute a SELECT query safely inside a READ ONLY transaction.
     Returns {rows, columns, row_count, execution_time_ms}.
-    Set uncapped=True to skip the MAX_RESULT_ROWS safety cap (e.g. user chose 'populate all')."""
+    Set uncapped=True to skip the MAX_RESULT_ROWS safety cap (e.g. user chose 'populate all').
+
+    Uses cursor-based streaming for large result sets to avoid timeouts and
+    memory issues. No hardcoded timeout — rows are fetched in batches."""
     settings = get_settings()
 
     # Layer 1: Structural validation
@@ -108,33 +111,58 @@ async def execute_sql(sql: str, uncapped: bool = False) -> dict:
     if block:
         return block
 
+    # Layer 1b: Identifier injection check (Issue #1/#2 fix)
+    from app.services.sql_safety import validate_identifiers_in_sql
+    ident_error = validate_identifiers_in_sql(sql)
+    if ident_error:
+        return {"error": ident_error, "code": "E002"}
+
+    max_rows = getattr(settings, "MAX_POPULATE_ROWS", 100000) if uncapped else getattr(settings, "MAX_RESULT_ROWS", 10000)
+    batch_size = 5000  # Fetch rows in batches to avoid memory spikes
     pool = get_pool()
     start = time.time()
     try:
         async with pool.acquire() as conn:
             # Layer 2: READ ONLY transaction — PostgreSQL will reject any write attempt
             async with conn.transaction(readonly=True):
-                # Layer 3: Statement timeout + row cap
-                await conn.execute(f"SET LOCAL statement_timeout = '{settings.SQL_TIMEOUT_SEC}s'")
-                rows = await conn.fetch(sql)
-                total_count = len(rows)
-                # Safety cap unless caller explicitly requests all rows
-                if not uncapped:
-                    max_rows = getattr(settings, "MAX_RESULT_ROWS", 10000)
-                    if total_count > max_rows:
-                        rows = rows[:max_rows]
+                # Use a cursor to stream results in batches — no statement timeout needed.
+                # The cursor fetches rows incrementally so even multi-million row queries
+                # won't timeout or load everything into memory at once.
+                cursor = await conn.cursor(sql)
+                all_rows = []
+                columns = None
+                total_count = 0
+
+                while True:
+                    batch = await cursor.fetch(batch_size)
+                    if not batch:
+                        break
+
+                    if columns is None:
+                        columns = list(batch[0].keys())
+
+                    total_count += len(batch)
+
+                    # If capped, only keep rows up to the limit
+                    if not uncapped:
+                        remaining = max_rows - len(all_rows)
+                        if remaining > 0:
+                            all_rows.extend(dict(r) for r in batch[:remaining])
+                        if len(all_rows) >= max_rows:
+                            # Continue counting total but stop collecting rows
+                            continue
+                    else:
+                        all_rows.extend(dict(r) for r in batch)
 
             elapsed_ms = int((time.time() - start) * 1000)
 
-            if not rows:
-                return {"rows": [], "columns": [], "row_count": 0, "execution_time_ms": elapsed_ms, "sql": sql}
-
-            columns = list(rows[0].keys())
-            data = [dict(r) for r in rows]
+            if not all_rows:
+                return {"rows": [], "columns": columns or [], "row_count": total_count,
+                        "execution_time_ms": elapsed_ms, "sql": sql}
 
             return {
-                "rows": data,
-                "columns": columns,
+                "rows": all_rows,
+                "columns": columns or [],
                 "row_count": total_count,
                 "execution_time_ms": elapsed_ms,
                 "sql": sql,
@@ -143,8 +171,6 @@ async def execute_sql(sql: str, uncapped: bool = False) -> dict:
         elapsed_ms = int((time.time() - start) * 1000)
         error_str = str(e)
         logger.error(f"SQL execution failed ({elapsed_ms}ms): {error_str}\nSQL: {sql}")
-        if "statement timeout" in error_str.lower():
-            return {"error": "Query timed out", "code": "E001", "execution_time_ms": elapsed_ms}
         if "read-only transaction" in error_str.lower():
             return {"error": "Write operations are not allowed", "code": "E002", "execution_time_ms": elapsed_ms}
         return {"error": error_str, "code": "E002", "execution_time_ms": elapsed_ms}

@@ -1,4 +1,5 @@
 """Schema introspection — reads tables, columns, FKs from information_schema."""
+import asyncio
 import json
 import logging
 from app.database import get_pool
@@ -10,7 +11,10 @@ logger = logging.getLogger(__name__)
 DOMAIN_SYNONYMS: dict[str, str] = {}
 
 # Max distinct values per column to build the value_index (low-cardinality columns only)
-_VALUE_INDEX_MAX_CARDINALITY = 200
+def _get_config_vals():
+    from app.config import get_settings
+    s = get_settings()
+    return s.SCHEMA_MAX_DISTINCT_VALUES, s.FUZZY_MATCH_THRESHOLD, s.VALUE_FUZZY_MIN_LENGTH_RATIO, s.SCHEMA_SAMPLE_ROWS, s.SCHEMA_LLM_CONCURRENCY
 
 
 class TableMeta:
@@ -93,10 +97,12 @@ class SchemaGraph:
             # Only compare strings of similar length to avoid false positives
             # (e.g. "visakhapatnam" vs "ap" should never match)
             len_ratio = min(len(val_lower), len(key)) / max(len(val_lower), len(key))
-            if len_ratio < 0.4:
+            _, _, min_len_ratio, _, _ = _get_config_vals()
+            if len_ratio < min_len_ratio:
                 continue
             score = fuzz.ratio(val_lower, key)
-            if score > best_score and score >= 75:
+            _, fuzzy_thresh, _, _, _ = _get_config_vals()
+            if score > best_score and score >= fuzzy_thresh:
                 best_score = score
                 best_match = entries
         if best_match:
@@ -199,7 +205,8 @@ async def inspect_schema() -> SchemaGraph:
         # Load sample rows (5 per table)
         for tname, tmeta in graph.tables.items():
             try:
-                samples = await conn.fetch(f"SELECT * FROM {schema}.{tname} LIMIT 5")
+                _, _, _, sample_rows, _ = _get_config_vals()
+                samples = await conn.fetch(f"SELECT * FROM {schema}.{tname} LIMIT {sample_rows}")
                 tmeta.sample_rows = [dict(r) for r in samples]
             except Exception:
                 pass
@@ -219,11 +226,12 @@ async def inspect_schema() -> SchemaGraph:
                         f"SELECT COUNT(DISTINCT {cname}) as cnt FROM {schema}.{tname}"
                     )
                     distinct_count = count_row["cnt"] if count_row else 0
-                    if distinct_count == 0 or distinct_count > _VALUE_INDEX_MAX_CARDINALITY:
+                    max_cardinality, _, _, _, _ = _get_config_vals()
+                    if distinct_count == 0 or distinct_count > max_cardinality:
                         continue
                     rows = await conn.fetch(
                         f"SELECT DISTINCT {cname} FROM {schema}.{tname} "
-                        f"WHERE {cname} IS NOT NULL LIMIT {_VALUE_INDEX_MAX_CARDINALITY}"
+                        f"WHERE {cname} IS NOT NULL LIMIT {max_cardinality}"
                     )
                     for row in rows:
                         val = row[cname]
@@ -238,39 +246,60 @@ async def inspect_schema() -> SchemaGraph:
         logger.info(f"  Value index built: {indexed_values} values, {len(graph.value_index)} unique keys")
 
     # Generate LLM descriptions for tables (cached in schema_index table)
+    # Uses parallel LLM calls with a semaphore to limit concurrency
     app_schema = settings.APP_SCHEMA
+    _, _, _, _, _LLM_CONCURRENCY = _get_config_vals()
     try:
         from app.services.llm_client import chat_json
-        generated = 0
+        sem = asyncio.Semaphore(_LLM_CONCURRENCY)
+        uncached_tables: list[str] = []
+
+        # Phase 1: load cached descriptions
         async with pool.acquire() as conn:
             for tname, tmeta in graph.tables.items():
-                # Check cache first
                 cached = await conn.fetchrow(
                     f"SELECT description FROM {app_schema}.schema_index WHERE table_name = $1 AND column_name IS NULL AND description IS NOT NULL",
                     tname
                 )
                 if cached and cached["description"]:
                     tmeta.description = cached["description"]
-                    continue
+                else:
+                    uncached_tables.append(tname)
 
-                # Generate via LLM
+        # Phase 2: generate missing descriptions in parallel
+        async def _generate_description(tname: str) -> tuple[str, str]:
+            async with sem:
+                tmeta = graph.tables[tname]
                 col_info = ", ".join(f"{c} ({v['data_type']})" for c, v in list(tmeta.columns.items())[:15])
                 desc_result = await chat_json([{"role": "user", "content":
                     f"Describe this database table in one sentence.\nTable: {tname}\nColumns: {col_info}\nReturn: {{\"description\": \"...\"}}"
                 }])
-                tmeta.description = desc_result.get("description", tname)
-                generated += 1
+                return tname, desc_result.get("description", tname)
 
-                # Persist to cache (upsert via delete + insert for NULL column_name)
-                await conn.execute(
-                    f"DELETE FROM {app_schema}.schema_index WHERE table_name = $1 AND column_name IS NULL",
-                    tname
-                )
-                await conn.execute(
-                    f"INSERT INTO {app_schema}.schema_index (table_name, description) VALUES ($1, $2)",
-                    tname, tmeta.description
-                )
+        if uncached_tables:
+            results = await asyncio.gather(
+                *[_generate_description(t) for t in uncached_tables],
+                return_exceptions=True,
+            )
 
+            # Phase 3: apply results and persist to cache
+            async with pool.acquire() as conn:
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning(f"LLM description failed: {result}")
+                        continue
+                    tname, description = result
+                    graph.tables[tname].description = description
+                    await conn.execute(
+                        f"DELETE FROM {app_schema}.schema_index WHERE table_name = $1 AND column_name IS NULL",
+                        tname
+                    )
+                    await conn.execute(
+                        f"INSERT INTO {app_schema}.schema_index (table_name, description) VALUES ($1, $2)",
+                        tname, description
+                    )
+
+        generated = len(uncached_tables)
         cached_count = len(graph.tables) - generated
         if generated > 0:
             logger.info(f"  Generated LLM descriptions for {generated} tables ({cached_count} cached)")
@@ -278,6 +307,37 @@ async def inspect_schema() -> SchemaGraph:
             logger.info(f"  Loaded {cached_count} table descriptions from cache")
     except Exception as e:
         logger.warning(f"LLM description generation skipped: {e}")
+
+    # Infer domain name FIRST (needed for domain-specific synonym generation)
+    try:
+        from app.services.llm_client import chat_json
+        async with pool.acquire() as conn:
+            cached = await conn.fetchrow(
+                f"SELECT description FROM {app_schema}.schema_index "
+                f"WHERE table_name = '_domain' AND column_name IS NULL"
+            )
+            if cached and cached["description"]:
+                graph.domain_name = cached["description"]
+            else:
+                descriptions = [t.description for t in graph.tables.values() if t.description]
+                schema_hint = schema.replace("_", " ").strip()
+                domain_result = await chat_json([{"role": "user", "content":
+                    f"""What is the specific business domain for a database called "{schema_hint}" with this data?
+{'; '.join(descriptions)}
+Return JSON with a precise single-word domain name: {{"domain": "..."}}
+Be specific: use "Banking" not "Financial", "Healthcare" not "Medical", "Retail" not "Commerce"."""}])
+                graph.domain_name = domain_result.get("domain", schema.split("_")[-1].title())
+                await conn.execute(
+                    f"DELETE FROM {app_schema}.schema_index WHERE table_name = '_domain' AND column_name IS NULL"
+                )
+                await conn.execute(
+                    f"INSERT INTO {app_schema}.schema_index (table_name, description) VALUES ('_domain', $1)",
+                    graph.domain_name
+                )
+        logger.info(f"  Domain: {graph.domain_name}")
+    except Exception as e:
+        graph.domain_name = schema.split("_")[-1].title() if "_" in schema else schema.title()
+        logger.warning(f"Domain inference skipped: {e}, using '{graph.domain_name}'")
 
     # Build synonym map: auto singular/plural + LLM-generated domain synonyms
     graph.synonyms = {}
@@ -307,22 +367,33 @@ async def inspect_schema() -> SchemaGraph:
                 for t in table_list:
                     col_summaries[t] = list(graph.tables[t].columns.keys())[:10]
 
+                domain = graph.domain_name or schema_name
+                # Include table descriptions for richer context
+                table_descs = {t: graph.tables[t].description for t in table_list if graph.tables[t].description}
+
                 syn_result = await chat_json([{"role": "user", "content":
-                    f"""Given this {schema_name} database schema, generate synonyms that users might use to refer to each table.
-Only include synonyms that are relevant to this specific domain/schema.
+                    f"""You are a {domain} domain expert. Generate synonyms that {domain} users would use to refer to each table.
+Only include synonyms specific to the {domain} domain.
+
+Domain: {domain}
 
 Tables and their columns:
 {json.dumps(col_summaries, indent=2)}
 
+Table descriptions:
+{json.dumps(table_descs, indent=2) if table_descs else "Not available"}
+
 Return JSON: {{"synonyms": {{"synonym_word": "actual_table_name", ...}}}}
-Example: {{"synonyms": {{"client": "customers", "acct": "accounts", "txn": "transactions"}}}}
+Return format: {{"synonyms": {{"user_term": "actual_table_name", "abbreviation": "actual_table_name", "concept_phrase": "actual_table_name"}}}}
 
 Rules:
-- Only include domain-appropriate synonyms (e.g. don't map "buyer" to "customers" in banking)
-- Include common abbreviations
-- Include singular/plural variants
-- Include multi-word domain phrases using underscores (e.g. "account_holder": "customers", "credit_card": "cards")
-- Each synonym must map to exactly one table from the list above"""}])
+- Include EVERYDAY words a non-technical user would say (e.g. "client": "customers", "money": "accounts", "purchase": "transactions", "staff": "employees", "shop": "merchants")
+- Include {domain}-specific abbreviations and jargon
+- Include singular AND plural variants (e.g. "client": "customers", "clients": "customers")
+- Include multi-word {domain} phrases using underscores (e.g. "account_holder": "customers")
+- Include conceptual phrases (e.g. "purchase_history": "transactions", "contact_info": "customers")
+- Each synonym must map to exactly one table from the list above
+- Prioritize words a regular person would use, not just {domain} professionals"""}])
                 synonyms = syn_result.get("synonyms", {})
 
                 # Cache it
@@ -342,37 +413,7 @@ Rules:
     except Exception as e:
         logger.warning(f"Domain synonym generation skipped: {e}")
 
-    # Infer domain name from table descriptions (cached)
-    try:
-        from app.services.llm_client import chat_json
-        async with pool.acquire() as conn:
-            cached = await conn.fetchrow(
-                f"SELECT description FROM {app_schema}.schema_index "
-                f"WHERE table_name = '_domain' AND column_name IS NULL"
-            )
-            if cached and cached["description"]:
-                graph.domain_name = cached["description"]
-            else:
-                descriptions = [t.description for t in graph.tables.values() if t.description]
-                # Derive a hint from schema name (e.g. "eds_banking" -> "banking")
-                schema_hint = schema.replace("_", " ").strip()
-                domain_result = await chat_json([{"role": "user", "content":
-                    f"""What is the specific business domain for a database called "{schema_hint}" with this data?
-{'; '.join(descriptions)}
-Return JSON with a precise single-word domain name: {{"domain": "..."}}
-Be specific: use "Banking" not "Financial", "Healthcare" not "Medical", "Retail" not "Commerce"."""}])
-                graph.domain_name = domain_result.get("domain", schema.split("_")[-1].title())
-                await conn.execute(
-                    f"DELETE FROM {app_schema}.schema_index WHERE table_name = '_domain' AND column_name IS NULL"
-                )
-                await conn.execute(
-                    f"INSERT INTO {app_schema}.schema_index (table_name, description) VALUES ('_domain', $1)",
-                    graph.domain_name
-                )
-        logger.info(f"  Domain: {graph.domain_name}")
-    except Exception as e:
-        graph.domain_name = schema.split("_")[-1].title() if "_" in schema else schema.title()
-        logger.warning(f"Domain inference skipped: {e}, using '{graph.domain_name}'")
+    # Domain name was already inferred above (before synonym generation)
 
     logger.info(f"Schema inspected: {len(graph.tables)} tables, {sum(len(t.columns) for t in graph.tables.values())} columns")
     return graph

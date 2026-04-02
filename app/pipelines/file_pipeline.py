@@ -5,6 +5,7 @@ import shutil
 import uuid
 from app.services.file_parser import parse_file, chunk_text
 from app.services.embedder import embed_texts, embed_single
+from app.services.sentence_encoder import fit_encoder, get_encoder
 from app.services.vector_search import insert_node, search
 from app.services.llm_client import chat_stream
 from app.services.response_beautifier import beautify, extract_follow_ups
@@ -35,7 +36,24 @@ async def execute_file_upload(file_path: str, file_name: str, message: str,
     chunks = chunk_text(content, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
 
     yield {"type": "step", "step_number": 4, "label": "Creating embeddings..."}
-    embeddings = await embed_texts([c[:500] for c in chunks])  # Truncate for embedding
+    # Expand encoder vocabulary with file content so SVD covers file terms
+    encoder = get_encoder()
+    if encoder.is_fitted:
+        # Refit on existing corpus + new chunks for better coverage
+        from app.database import get_pool
+        pool = get_pool()
+        schema = settings.APP_SCHEMA
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"SELECT content FROM {schema}.embedding_metadata WHERE content IS NOT NULL AND content != ''"
+                )
+            existing = [r["content"] for r in rows]
+            fit_encoder(existing + [c[:500] for c in chunks])
+        except Exception as e:
+            logger.warning(f"Encoder refit on file chunks failed: {e}")
+    # Use "passage" mode for document chunks (Stage 15+16)
+    embeddings = await embed_texts([c[:500] for c in chunks], mode="passage")
 
     # Store chunks in DB and FAISS
     pool = get_pool()
@@ -66,7 +84,12 @@ async def execute_file_upload(file_path: str, file_name: str, message: str,
     context = "\n\n".join(chunks[:5])  # Use first 5 chunks for initial response
 
     full_text = ""
-    async for token in chat_stream([{"role": "user", "content": f"File: {file_name}\nContent:\n{context}\n\nUser question: {query}\n\nProvide a helpful response about this file. Use markdown formatting."}]):
+    async for token in chat_stream([{"role": "user", "content": (
+        f"File: {file_name}\nContent:\n{context}\n\n"
+        f"User message: {query}\n\n"
+        "Respond naturally to the user's message first, then provide a helpful analysis of the file. "
+        "Use markdown formatting."
+    )}]):
         full_text += token
         yield {"type": "text_delta", "delta": token}
 
@@ -94,9 +117,10 @@ async def execute_file_followup(message: str, session_state: dict):
     # Embed the question
     query_emb = await embed_single(message)
 
-    # Search chunks
+    # Search chunks (hybrid: dense FAISS + sparse BM25)
     results = await search("chunks_idx", query_emb, k=5,
-                           filter_key="session_id", filter_value=session_state["session_id"])
+                           filter_key="session_id", filter_value=session_state["session_id"],
+                           query_text=message)
 
     # Retrieve full chunk text
     pool = get_pool()

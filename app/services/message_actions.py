@@ -82,11 +82,23 @@ async def edit_user_message(message_id: str, new_content: str) -> dict:
         )
 
         # Deactivate all messages after this one in the same session
+        # Also clean up orphaned feedback for deactivated messages (Issue #13)
+        deactivated_ids = await conn.fetch(
+            f"""SELECT id FROM {schema}.chat_messages
+                WHERE session_id=$1 AND created_at > $2 AND is_active=true""",
+            msg["session_id"], msg["created_at"]
+        )
         result = await conn.execute(
             f"""UPDATE {schema}.chat_messages SET is_active=false
                 WHERE session_id=$1 AND created_at > $2 AND is_active=true""",
             msg["session_id"], msg["created_at"]
         )
+        if deactivated_ids:
+            ids = [str(r["id"]) for r in deactivated_ids]
+            await conn.execute(
+                f"DELETE FROM {schema}.feedback WHERE message_id = ANY($1::uuid[])",
+                ids
+            )
 
         # Count deactivated
         count_str = result.split()[-1] if result else "0"

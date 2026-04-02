@@ -10,18 +10,50 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 @router.get("/health")
 async def health():
     """Health check — no auth required (used by load balancers)."""
+    from app.startup_validator import is_llm_available
     db_ok = await health_check()
-    return {"status": "healthy" if db_ok else "unhealthy", "database": db_ok}
+    llm_ok = is_llm_available()
+    # Server is healthy if DB is up; LLM being down = degraded, not unhealthy
+    status = "healthy" if db_ok else "unhealthy"
+    if db_ok and not llm_ok:
+        status = "degraded"
+    return {"status": status, "database": db_ok, "llm": llm_ok}
 
 
 @router.post("/reseed-schema")
 async def reseed_schema(user: User = Depends(require_admin)):
     """Re-run schema introspection and rebuild indexes. Admin only."""
     from app.services.schema_inspector import inspect_schema
+    from app.services.schema_seeder import seed_all
     from app.orchestrator import set_schema_graph
     graph = await inspect_schema()
     set_schema_graph(graph)
+    await seed_all(graph)
     return {"status": "reseeded", "tables": len(graph.tables)}
+
+
+@router.get("/embedding-eval")
+async def embedding_eval(user: User = Depends(require_admin)):
+    """Run embedding quality evaluation (Stage 27). Admin only."""
+    from app.services.embedding_eval import evaluate_retrieval
+    from app.orchestrator import get_schema_graph as _schema_graph_fn
+    _schema_graph = _schema_graph_fn()
+    if _schema_graph is None:
+        return {"error": "Schema not loaded yet"}
+    report = await evaluate_retrieval(_schema_graph, k=5)
+    return report
+
+
+@router.get("/drift-check")
+async def drift_check(user: User = Depends(require_admin)):
+    """Run embedding drift monitoring (Stage 30). Admin only."""
+    from app.services.drift_monitor import run_full_drift_check
+    from app.orchestrator import get_schema_graph as _schema_graph_fn
+    _schema_graph = _schema_graph_fn()
+    if _schema_graph is None:
+        return {"error": "Schema not loaded yet"}
+    report = await run_full_drift_check(_schema_graph)
+    return report
 
 
 @router.post("/cleanup")
@@ -34,14 +66,15 @@ async def cleanup(user: User = Depends(require_admin)):
 
 
 @router.get("/audit-log")
-async def get_audit_log(limit: int = 50, user: User = Depends(require_admin)):
+async def get_audit_log(limit: int = None, user: User = Depends(require_admin)):
     """View audit log. Admin only."""
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT * FROM {schema}.audit_log ORDER BY created_at DESC LIMIT $1", limit
+            f"SELECT * FROM {schema}.audit_log ORDER BY created_at DESC LIMIT $1",
+            limit or settings.AUDIT_LOG_LIMIT
         )
         return [dict(r) for r in rows]
 

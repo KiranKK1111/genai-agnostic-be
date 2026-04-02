@@ -48,6 +48,15 @@ class FAISSIndex:
             self._initialized = True
             return
 
+        # Auto-detect dimensions from actual data if they differ from config
+        actual_dim = embeddings.shape[1] if embeddings.ndim == 2 else self.dimensions
+        if actual_dim != self.dimensions:
+            logger.warning(
+                f"FAISS '{self.index_name}': dimension mismatch — "
+                f"config={self.dimensions}, data={actual_dim}. Using data dimension."
+            )
+            self.dimensions = actual_dim
+
         # Normalize for cosine similarity (inner product on normalized = cosine)
         faiss.normalize_L2(embeddings)
 
@@ -124,14 +133,16 @@ async def get_faiss_index(index_name: str) -> FAISSIndex:
 
 
 async def load_index_from_db(index_name: str):
-    """Load a FAISS index from PostgreSQL embedding_metadata table."""
+    """Load a FAISS index + BM25 index from PostgreSQL embedding_metadata table."""
+    from app.services.bm25_manager import build_bm25_index
+
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"""SELECT id, embedding FROM {schema}.embedding_metadata
+            f"""SELECT id, embedding, content FROM {schema}.embedding_metadata
                 WHERE index_name = $1 ORDER BY id""",
             index_name
         )
@@ -145,13 +156,24 @@ async def load_index_from_db(index_name: str):
 
         embeddings = np.array([list(r["embedding"]) for r in rows], dtype=np.float32)
         metadata_ids = [r["id"] for r in rows]
+        contents = [r["content"] or "" for r in rows]
         idx.build(embeddings, metadata_ids)
+
+        # Build BM25 sparse index alongside FAISS dense index
+        if any(contents):
+            build_bm25_index(index_name, contents, metadata_ids)
+            logger.info(f"BM25 index '{index_name}' built: {len(contents)} docs")
 
 
 async def load_all_indexes():
-    """Load all 3 indexes from PostgreSQL at startup."""
+    """Load all 3 indexes from PostgreSQL (fallback only).
+
+    NOTE: This is only used as a fallback when re-seeding fails.
+    Normal startup always re-seeds to ensure encoder and vectors are in sync.
+    """
     for name in ("schema_idx", "values_idx", "chunks_idx"):
         await load_index_from_db(name)
+
     total = 0
     for name in ("schema_idx", "values_idx", "chunks_idx"):
         idx = await get_faiss_index(name)
@@ -187,6 +209,11 @@ async def add_to_index(index_name: str, embedding: list[float], payload: dict,
     async with idx._lock:
         vec = np.array(embedding, dtype=np.float32)
         idx.add(vec, metadata_id)
+
+    # Step 3: Add to BM25 (in-memory) for hybrid search
+    if content:
+        from app.services.bm25_manager import add_to_bm25_index
+        add_to_bm25_index(index_name, content, metadata_id)
 
     return metadata_id
 
@@ -229,7 +256,13 @@ async def batch_add_to_index(index_name: str, embeddings: list[list[float]],
             vec = np.array(emb, dtype=np.float32)
             idx.add(vec, mid)
 
-    logger.info(f"Batch added {len(metadata_ids)} vectors to '{index_name}'")
+    # Step 3: Add to BM25 for hybrid search
+    from app.services.bm25_manager import add_to_bm25_index
+    for content, mid in zip(contents, metadata_ids):
+        if content:
+            add_to_bm25_index(index_name, content, mid)
+
+    logger.info(f"Batch added {len(metadata_ids)} vectors to '{index_name}' (FAISS + BM25)")
     return metadata_ids
 
 
@@ -395,7 +428,9 @@ async def trace_retrieval(user_query: str, index_name: str, matched_nodes: list[
 
 
 async def clear_index(index_name: str):
-    """Clear a FAISS index and its PostgreSQL metadata. Thread-safe."""
+    """Clear a FAISS index, BM25 index, and PostgreSQL metadata. Thread-safe."""
+    from app.services.bm25_manager import clear_bm25_index
+
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
@@ -409,7 +444,13 @@ async def clear_index(index_name: str):
                 index_name
             )
 
-        # Rebuild empty FAISS index
+        # Reset dimensions from config (in case they were auto-detected from stale data)
+        idx.dimensions = settings.EMBEDDING_DIMENSIONS
+
+        # Rebuild empty FAISS index with correct dimensions
         idx.build(np.array([], dtype=np.float32).reshape(0, settings.EMBEDDING_DIMENSIONS), [])
 
-    logger.info(f"FAISS index '{index_name}' cleared")
+    # Clear BM25 sparse index
+    clear_bm25_index(index_name)
+
+    logger.info(f"FAISS + BM25 index '{index_name}' cleared (dim={settings.EMBEDDING_DIMENSIONS})")

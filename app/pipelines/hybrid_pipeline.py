@@ -20,7 +20,8 @@ async def execute_hybrid(message: str, session_state: dict):
     # Get relevant file chunks
     query_emb = await embed_single(message)
     file_results = await search("chunks_idx", query_emb, k=3,
-                                 filter_key="session_id", filter_value=session_state["session_id"])
+                                 filter_key="session_id", filter_value=session_state["session_id"],
+                                 query_text=message)
 
     pool = get_pool()
     file_chunks = []
@@ -37,11 +38,17 @@ async def execute_hybrid(message: str, session_state: dict):
     # Get cached DB data
     db_data = session_state.get("last_data", [])
     db_columns = session_state.get("last_columns", [])
-    db_summary = f"Database results: {len(db_data)} rows, columns: {', '.join(db_columns[:10])}"
+    friendly_cols = ', '.join(c.replace('_', ' ').title() for c in db_columns[:10])
+    db_summary = f"Database results: {len(db_data)} records with fields: {friendly_cols}"
     if db_data:
-        db_summary += f"\nSample: {str(db_data[:3])[:500]}"
+        # Sanitize sample rows with friendly labels
+        sample_rows = []
+        for row in db_data[:3]:
+            sanitized = {k.replace('_', ' ').title(): str(v) for k, v in row.items()}
+            sample_rows.append(sanitized)
+        db_summary += f"\nSample: {str(sample_rows)[:500]}"
 
-    file_summary = f"File content:\n{'\n'.join(file_chunks[:3])}"
+    file_summary = f"File content:\n{chr(10).join(file_chunks[:3])}"
 
     yield {"type": "step", "step_number": 3, "label": "Generating comparison..."}
 
@@ -53,7 +60,8 @@ async def execute_hybrid(message: str, session_state: dict):
 
 User question: "{message}"
 
-Provide a clear comparison. Highlight matches, discrepancies, and insights. Use markdown formatting."""
+Provide a clear comparison. Highlight matches, discrepancies, and insights. Use markdown formatting.
+IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details. Use natural business language only."""
 
     full_text = ""
     async for token in chat_stream([{"role": "user", "content": prompt}]):

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import get_settings
 from app.database import create_pool, close_pool
 from app.services.schema_inspector import inspect_schema
-from app.services.schema_seeder import seed_schema_index
+from app.services.schema_seeder import seed_all
 
 
 async def reseed():
@@ -15,9 +15,9 @@ async def reseed():
     print("Inspecting schema...")
     graph = await inspect_schema()
     print(f"Found {len(graph.tables)} tables")
-    print("Seeding FAISS index...")
-    await seed_schema_index(graph)
-    print("✓ Schema index re-seeded")
+    print("Seeding FAISS + BM25 indexes...")
+    await seed_all(graph)
+    print("✓ Schema indexes re-seeded")
     await close_pool()
 
 

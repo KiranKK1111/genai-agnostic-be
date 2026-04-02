@@ -57,9 +57,11 @@ async def get_current_user(
     token = credentials.credentials
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        user_id = payload.get("sub", "")
+        username = payload.get("username", "") or payload.get("name", "") or "User"
         return User(
-            id=payload.get("sub", ""),
-            username=payload.get("username", ""),
+            id=user_id,
+            username=username,
             role=payload.get("role", "user"),
         )
     except jwt.ExpiredSignatureError:

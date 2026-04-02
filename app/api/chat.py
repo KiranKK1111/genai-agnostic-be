@@ -56,6 +56,10 @@ async def chat_stream(req: ChatRequest, user: User = Depends(get_current_user)):
                 event_type = event.pop("type", "data")
                 await buffer.put(event_type, event)
             await buffer.close()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            logger.info("Client disconnected during stream")
+            await buffer.close()
+            return
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             await buffer.put("error", {"code": "E099", "message": str(e), "recoverable": False})
@@ -122,11 +126,48 @@ async def clarify(req: ClarifyRequest, user: User = Depends(get_current_user)):
     session_mgr = SessionManager()
     state = await session_mgr.get_or_create(req.session_id)
 
+    # Handle dismiss — user closed the clarification popup
+    if req.clarification_type == "__dismissed":
+        state["clarification_pending"] = None
+        state["clarification_response"] = None
+        state["clarification_display"] = None
+        state["clarification_history"] = []
+        await session_mgr.save(state)
+        return {"status": "dismissed", "session_id": req.session_id}
+
     # Store the user's selection so CLARIFICATION_REPLY handler can use it
     state["clarification_response"] = {
         "type": req.clarification_type,
         "selected_values": req.selected_values,
     }
+
+    # Accumulate Q&A pair in clarification_history so all pairs can be
+    # displayed together after the user finishes answering all questions.
+    pending = state.get("clarification_pending") or {}
+    display = state.get("clarification_display") or {}
+    question_text = display.get("question") or pending.get("question", "")
+    # Derive a human-readable answer label
+    selected = req.selected_values
+    if selected == "__default":
+        answer_text = "Skipped (using default)"
+    elif isinstance(selected, list):
+        answer_text = ", ".join(str(v) for v in selected)
+    elif isinstance(selected, dict):
+        answer_text = str(selected)
+    else:
+        answer_text = str(selected)
+    # Try to resolve option labels for display
+    options = display.get("options") or pending.get("options") or []
+    if options and isinstance(selected, str):
+        for opt in options:
+            if opt.get("value") == selected:
+                answer_text = opt.get("label", selected)
+                break
+
+    history = state.get("clarification_history", [])
+    history.append({"question": question_text, "answer": answer_text, "type": req.clarification_type})
+    state["clarification_history"] = history
+
     # Keep clarification_pending so intent classifier routes to CLARIFICATION_REPLY
     # (it gets cleared after the pipeline re-runs in orchestrator)
 
@@ -157,8 +198,8 @@ async def list_sessions(user: User = Depends(get_current_user)):
                        (SELECT COUNT(*) FROM {schema}.chat_messages WHERE session_id=s.id AND is_active=true) as message_count
                 FROM {schema}.chat_sessions s
                 WHERE s.user_id = $1
-                ORDER BY updated_at DESC LIMIT 50""",
-            user.id
+                ORDER BY updated_at DESC LIMIT $2""",
+            user.id, settings.CHAT_HISTORY_LIMIT
         )
         return [dict(r) for r in rows]
 
@@ -178,7 +219,12 @@ async def get_session(session_id: str, user: User = Depends(get_current_user)):
             raise HTTPException(403, "Access denied")
     session_mgr = SessionManager()
     messages = await session_mgr.get_session_messages(session_id)
-    return {"session_id": session_id, "messages": messages}
+    # Include pending clarification so the frontend can restore the popup on reload
+    state = await session_mgr.kv.get(f"session:{session_id}")
+    pending_clar = None
+    if state and state.get("clarification_pending") and state.get("clarification_display"):
+        pending_clar = state["clarification_display"]
+    return {"session_id": session_id, "messages": messages, "pending_clarification": pending_clar}
 
 
 @router.delete("/session/{session_id}")
@@ -192,6 +238,18 @@ async def delete_session(session_id: str, user: User = Depends(get_current_user)
         result = await conn.execute(
             f"DELETE FROM {schema}.chat_sessions WHERE id=$1::uuid AND (user_id=$2 OR $3)",
             session_id, user.id, user.role == "admin"
+        )
+    # Clean up orphaned embedding vectors for this session's chunks (Issue #8)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""DELETE FROM {schema}.embedding_metadata
+                WHERE index_name = 'chunks_idx'
+                  AND payload->>'session_id' = $1""",
+            session_id
+        )
+        await conn.execute(
+            f"DELETE FROM {schema}.file_chunks WHERE session_id = $1::uuid",
+            session_id
         )
     from app.services.kv_store import KVStore
     kv = KVStore()
@@ -252,6 +310,21 @@ async def retry_message(message_id: str, user: User = Depends(get_current_user))
         # Deactivate old response
         await conn.execute(f"UPDATE {schema}.chat_messages SET is_active=false WHERE id=$1::uuid", message_id)
 
+    # Restore session context from parent message snapshot (Issue #14)
+    if parent_msg.get("session_snapshot"):
+        try:
+            import json as _json
+            snapshot = _json.loads(parent_msg["session_snapshot"]) if isinstance(parent_msg["session_snapshot"], str) else parent_msg["session_snapshot"]
+            from app.services.session import SessionManager
+            sm = SessionManager()
+            state = await sm.get_or_create(str(msg["session_id"]), user.id)
+            for key in ("last_sql", "last_plan", "last_data", "last_columns", "last_table", "last_intent"):
+                if key in snapshot:
+                    state[key] = snapshot[key]
+            await sm.save(state)
+        except Exception:
+            pass  # Non-critical — session will still work without snapshot
+
     # Re-process
     async def event_generator():
         async for event in process_message(
@@ -267,7 +340,7 @@ async def retry_message(message_id: str, user: User = Depends(get_current_user))
 
 # ── Search ─────────────────────────────────────────────────
 @router.get("/search")
-async def search_messages(q: str = Query(..., min_length=1), limit: int = 20, user: User = Depends(get_current_user)):
+async def search_messages(q: str = Query(..., min_length=1), limit: int = None, user: User = Depends(get_current_user)):
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
@@ -279,7 +352,7 @@ async def search_messages(q: str = Query(..., min_length=1), limit: int = 20, us
                 JOIN {schema}.chat_sessions s ON m.session_id = s.id
                 WHERE m.content ILIKE $1 AND m.is_active=true
                 ORDER BY m.created_at DESC LIMIT $2""",
-            f"%{q}%", limit
+            f"%{q}%", limit or settings.DEFAULT_SEARCH_LIMIT
         )
         return [dict(r) for r in rows]
 
@@ -379,7 +452,7 @@ class SaveQueryRequest(BaseModel):
 async def save_query(req: SaveQueryRequest, user: User = Depends(get_current_user)):
     from app.services.saved_queries import save_query as do_save
     query_id = await do_save(
-        user_id="local", name=req.name, prompt=req.prompt,
+        user_id=user.id, name=req.name, prompt=req.prompt,
         sql=req.sql, viz_config=req.viz_config, tags=req.tags
     )
     return {"id": query_id, "status": "saved"}
@@ -387,13 +460,13 @@ async def save_query(req: SaveQueryRequest, user: User = Depends(get_current_use
 @router.get("/queries")
 async def list_queries(user: User = Depends(get_current_user)):
     from app.services.saved_queries import list_saved_queries
-    return await list_saved_queries(user_id="local")
+    return await list_saved_queries(user_id=user.id)
 
 @router.post("/queries/{query_id}/run")
 async def run_saved_query(query_id: str, user: User = Depends(get_current_user)):
     """Re-execute a saved query."""
     from app.services.saved_queries import get_saved_query, increment_run_count
-    query = await get_saved_query(query_id, user_id="local")
+    query = await get_saved_query(query_id, user_id=user.id)
     if not query:
         raise HTTPException(404, "Saved query not found")
 
@@ -415,5 +488,5 @@ async def run_saved_query(query_id: str, user: User = Depends(get_current_user))
 @router.delete("/queries/{query_id}")
 async def delete_query(query_id: str, user: User = Depends(get_current_user)):
     from app.services.saved_queries import delete_saved_query
-    await delete_saved_query(query_id, user_id="local")
+    await delete_saved_query(query_id, user_id=user.id)
     return {"status": "deleted"}

@@ -28,6 +28,7 @@ def new_session_state(session_id: str, user_id: str = None) -> dict:
         "intent_chain": [],
         "file_context": None,
         "clarification_pending": None,
+        "clarification_history": [],   # Accumulated Q&A pairs across chained clarifications
         "cancel_requested": False,
         "expires_at": expires.isoformat(),
         "total_turns": 0,
@@ -63,6 +64,8 @@ class SessionManager:
         # Reset expires_at to +TTL on every save (per spec: reset on every message)
         import datetime as _dt
         state["expires_at"] = (datetime.now(timezone.utc) + _dt.timedelta(hours=self.settings.SESSION_TTL_HOURS)).isoformat()
+        # Increment version counter to detect concurrent modification (Issue #4)
+        state["_version"] = state.get("_version", 0) + 1
         await self.kv.set(f"session:{state['session_id']}", state, namespace="session", ttl_seconds=ttl)
 
     async def append_history(self, state: dict, role: str, content: str):
@@ -112,4 +115,51 @@ class SessionManager:
                     ORDER BY created_at ASC""",
                 session_id
             )
-            return [dict(r) for r in rows]
+            messages = []
+            for r in rows:
+                msg = dict(r)
+                # Reconstruct a full response object from persisted metadata
+                # so the frontend can render tables, charts, and clarifications on reload
+                if msg["role"] == "assistant":
+                    meta = msg.get("metadata") or {}
+                    if isinstance(meta, str):
+                        meta = json.loads(meta)
+                    response = {
+                        "message": msg["content"],
+                        "sql": msg.get("content_sql"),
+                    }
+                    # Reconstruct data payload
+                    data_meta = meta.get("data")
+                    if data_meta and data_meta.get("rows"):
+                        response["data"] = {
+                            "columns": data_meta.get("columns", []),
+                            "rows": data_meta["rows"],
+                            "row_count": data_meta.get("row_count", len(data_meta["rows"])),
+                            "truncated": data_meta.get("truncated", False),
+                        }
+                    # Reconstruct visualizations
+                    viz_meta = meta.get("viz_config")
+                    if data_meta and data_meta.get("rows"):
+                        viz_type = (viz_meta or {}).get("viz_type", "table")
+                        available_views = (viz_meta or {}).get("available_views", ["table", "bar", "pie", "line"])
+                        response["visualizations"] = [{
+                            "chart_id": "auto-viz",
+                            "type": viz_type,
+                            "title": "Data",
+                            "data": data_meta["rows"],
+                            "config": {
+                                "available_views": available_views,
+                                "primary_view": viz_type,
+                            },
+                        }]
+                    # Reconstruct clarification
+                    clar_meta = meta.get("clarification")
+                    if clar_meta:
+                        response["clarifying_question"] = clar_meta
+                    # Reconstruct clarification Q&A pairs
+                    qa_meta = meta.get("clarification_qa")
+                    if qa_meta:
+                        response["clarification_qa"] = qa_meta
+                    msg["response"] = response
+                messages.append(msg)
+            return messages

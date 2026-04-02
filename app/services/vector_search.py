@@ -1,13 +1,16 @@
-"""Vector search — FAISS (in-memory) + PostgreSQL (persistence).
+"""Vector search — Hybrid FAISS + BM25 with PostgreSQL persistence.
 
 Architecture:
-    FAISS   → embeddings in RAM for fast similarity search
+    FAISS   → dense embeddings in RAM for semantic similarity search
+    BM25    → sparse term index in RAM for exact keyword matching
+    RRF     → Reciprocal Rank Fusion combines both result sets
     PostgreSQL → metadata + mappings + search logs + results (source of truth)
 
 Flow:
-    Search:  Query → Embedding → FAISS similarity → Top-K IDs → PostgreSQL metadata
-    Insert:  Embedding → FAISS (memory) + PostgreSQL (persistence)
-    Startup: PostgreSQL → load into FAISS indexes
+    Search:  Query → Embedding + Text → Hybrid(FAISS + BM25) → RRF Fusion
+             → Top-K IDs → PostgreSQL metadata
+    Insert:  Embedding → FAISS (memory) + BM25 (memory) + PostgreSQL (persistence)
+    Startup: PostgreSQL → load into FAISS + BM25 indexes
 """
 import json
 import hashlib
@@ -17,15 +20,59 @@ from app.services.faiss_manager import (
     log_search, get_cached_retrieval, cache_retrieval,
     trace_retrieval,
 )
+from app.services.hybrid_search import hybrid_search
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
 async def search(index_name: str, query_embedding: list[float], k: int = 5,
-                 filter_key: str = None, filter_value: str = None) -> list[dict]:
-    """Search FAISS index → fetch metadata from PostgreSQL.
-    Returns [{node_id, similarity, payload}]."""
+                 filter_key: str = None, filter_value: str = None,
+                 query_text: str = None) -> list[dict]:
+    """Search using hybrid FAISS+BM25 → fetch metadata from PostgreSQL.
+    Returns [{node_id, similarity, payload}].
+
+    If query_text is provided, uses hybrid search (FAISS dense + BM25 sparse).
+    Otherwise falls back to FAISS-only dense search.
+    """
+    if query_text and not filter_key:
+        # Hybrid search: combine dense + sparse via RRF
+        fused_results = await hybrid_search(
+            index_name, query_text, query_embedding, k=k * 3 if filter_key else k
+        )
+        if fused_results:
+            # Fetch metadata from PostgreSQL for fused results
+            metadata_ids = [r[0] for r in fused_results]
+            scores = {r[0]: r[1] for r in fused_results}
+
+            from app.database import get_pool
+            settings = get_settings()
+            pool = get_pool()
+            schema = settings.APP_SCHEMA
+
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    f"""SELECT id, payload, content FROM {schema}.embedding_metadata
+                        WHERE id = ANY($1::int[])""",
+                    metadata_ids
+                )
+
+            results = []
+            for row in rows:
+                payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+                if filter_key and filter_value:
+                    if payload.get(filter_key) != filter_value:
+                        continue
+                results.append({
+                    "node_id": str(row["id"]),
+                    "similarity": scores.get(row["id"], 0.0),
+                    "payload": payload,
+                })
+
+            results.sort(key=lambda x: x["similarity"], reverse=True)
+            return results[:k]
+
+    # Fallback: FAISS-only dense search
     results = await search_index(index_name, query_embedding, k=k,
                                  filter_key=filter_key, filter_value=filter_value)
     return results
@@ -68,7 +115,7 @@ async def schema_search(query: str, k: int = 5) -> list[dict]:
             ]
 
     embedding = await embed_single(query)
-    results = await search("schema_idx", embedding, k=k)
+    results = await search("schema_idx", embedding, k=k, query_text=query)
 
     # Log search + cache results + trace retrieval
     matched_ids = [int(r["node_id"]) for r in results]
@@ -99,7 +146,7 @@ async def ground_value(value: str, k: int = 5) -> list[dict]:
     Returns [{value, table, column, similarity}]."""
     from app.services.embedder import embed_single
     embedding = await embed_single(value)
-    results = await search("values_idx", embedding, k=k)
+    results = await search("values_idx", embedding, k=k, query_text=value)
 
     # Log the grounding search
     matched_ids = [int(r["node_id"]) for r in results]
@@ -130,7 +177,8 @@ async def retrieve_chunks(query: str, session_id: str, k: int = 5) -> list[dict]
     from app.services.embedder import embed_single
     embedding = await embed_single(query)
     results = await search("chunks_idx", embedding, k=k,
-                           filter_key="session_id", filter_value=session_id)
+                           filter_key="session_id", filter_value=session_id,
+                           query_text=query)
 
     # Log the retrieval search
     matched_ids = [int(r["node_id"]) for r in results]

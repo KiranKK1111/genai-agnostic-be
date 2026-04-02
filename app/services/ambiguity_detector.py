@@ -13,10 +13,7 @@ from app.services.schema_inspector import SchemaGraph
 
 logger = logging.getLogger(__name__)
 
-# If top-2 similarity scores are within this gap, it's ambiguous
-AMBIGUITY_GAP = 0.12
-# Minimum similarity to consider a result relevant at all
-MIN_SIMILARITY = 0.50
+from app.config import get_settings as _get_settings
 
 
 async def detect_ambiguous_table(token: str, schema_graph: SchemaGraph) -> dict | None:
@@ -25,8 +22,9 @@ async def detect_ambiguous_table(token: str, schema_graph: SchemaGraph) -> dict 
     Example: "account" could match "accounts" AND "account_logs"
     Returns clarification payload if ambiguous, None if clear.
     """
-    query_emb = await embed_single(f"table {token}")
-    results = await search("schema_idx", query_emb, k=3)
+    query_text = f"table {token}"
+    query_emb = await embed_single(query_text)
+    results = await search("schema_idx", query_emb, k=3, query_text=query_text)
 
     # Filter to table-type entries only
     table_results = [r for r in results if r["payload"].get("type") == "table"]
@@ -38,24 +36,28 @@ async def detect_ambiguous_table(token: str, schema_graph: SchemaGraph) -> dict 
     second = table_results[1]["similarity"]
 
     # Ambiguous if top-2 are close AND both are above minimum
-    if top - second < AMBIGUITY_GAP and second > MIN_SIMILARITY:
+    _s = _get_settings()
+    if top - second < _s.AMBIGUITY_GAP and second > _s.MIN_SIMILARITY:
         options = []
         for r in table_results[:3]:
             tname = r["payload"].get("table", "")
             if tname in schema_graph.tables:
                 tmeta = schema_graph.tables[tname]
-                col_preview = ", ".join(list(tmeta.columns.keys())[:5])
+                # Use friendly labels — no raw table/column names
+                friendly_name = tname.replace('_', ' ').title()
+                desc = tmeta.description if hasattr(tmeta, 'description') and tmeta.description else f"{friendly_name} data"
                 options.append({
                     "value": tname,
-                    "label": tname,
-                    "description": f"{len(tmeta.columns)} columns: {col_preview}...",
+                    "label": friendly_name,
+                    "description": desc,
                     "similarity": round(r["similarity"], 3),
                 })
         if len(options) >= 2:
             return {
                 "type": "ambiguous_table",
                 "mode": "single_select",
-                "question": f"I found multiple tables that could match '{token}'. Which one did you mean?",
+                "support_for_custom_replies": False,
+                "question": f"I found multiple data categories that could match '{token}'. Which one did you mean?",
                 "options": options,
                 "token": token,
             }
@@ -76,10 +78,12 @@ async def detect_ambiguous_column(token: str, tables: list[str],
         for cname, cinfo in schema_graph.tables[tname].columns.items():
             # Exact or substring match
             if token.lower() in cname or cname in token.lower():
+                friendly_col = cname.replace('_', ' ').title()
+                friendly_table = tname.replace('_', ' ').title()
                 matches.append({
                     "value": f"{tname}.{cname}",
-                    "label": f"{tname}.{cname}",
-                    "description": f"type: {cinfo['data_type']}",
+                    "label": f"{friendly_col} in {friendly_table}",
+                    "description": "",
                     "table": tname,
                     "column": cname,
                 })
@@ -93,7 +97,8 @@ async def detect_ambiguous_column(token: str, tables: list[str],
         return {
             "type": "ambiguous_column",
             "mode": "single_select",
-            "question": f"'{token}' could refer to multiple columns. Which one did you mean?",
+            "support_for_custom_replies": False,
+            "question": f"'{token}' could refer to multiple fields. Which one did you mean?",
             "options": matches[:4],
             "token": token,
         }
@@ -129,10 +134,12 @@ async def detect_ambiguous_value(value: str, tables: list[str],
                             value
                         )
                         if row:
+                            friendly_col = cname.replace('_', ' ').title()
+                            friendly_table = tname.replace('_', ' ').title()
                             matches.append({
                                 "value": f"{tname}.{cname}",
-                                "label": f"'{value}' in {tname}.{cname}",
-                                "description": f"Filter {tname}.{cname} = '{row[cname]}'",
+                                "label": f"'{value}' in {friendly_table} ({friendly_col})",
+                                "description": "",
                                 "table": tname,
                                 "column": cname,
                                 "actual_value": row[cname],
@@ -146,7 +153,8 @@ async def detect_ambiguous_value(value: str, tables: list[str],
         return {
             "type": "ambiguous_value",
             "mode": "single_select",
-            "question": f"'{value}' was found in multiple columns. Which one did you mean?",
+            "support_for_custom_replies": False,
+            "question": f"'{value}' was found in multiple places. Which one did you mean?",
             "options": matches[:4],
             "token": value,
         }
@@ -155,20 +163,27 @@ async def detect_ambiguous_value(value: str, tables: list[str],
 
 async def detect_ambiguities(user_message: str, plan_tables: list[str],
                               filter_values: list[str],
-                              schema_graph: SchemaGraph) -> dict | None:
+                              schema_graph: SchemaGraph,
+                              resolved_ambiguities: list[dict] = None) -> dict | None:
     """Run all ambiguity checks. Returns first clarification found, or None.
 
     Check order (most impactful first):
         1. Ambiguous tables
         2. Ambiguous filter values
         3. Ambiguous columns
+
+    resolved_ambiguities: list of previously resolved ambiguities to skip
+        (prevents re-asking the same question after user already answered)
     """
     import re
+    resolved_ambiguities = resolved_ambiguities or []
+    # Build a set of tokens that were already resolved by previous clarifications
+    resolved_tokens = {r.get("token", "").lower() for r in resolved_ambiguities if r.get("token")}
 
     # Extract tokens that might be table references
     tokens = user_message.lower().split()
     for token in tokens:
-        if len(token) < 3:
+        if len(token) < 3 or token in resolved_tokens:
             continue
         # Only check tokens that partially match 2+ tables
         matching_tables = [t for t in schema_graph.tables if token in t or t in token]
@@ -193,8 +208,12 @@ async def detect_ambiguities(user_message: str, plan_tables: list[str],
                 break
 
     # Check ambiguous values (e.g., "ACTIVE" in multiple columns)
+    # Skip values already resolved by previous clarification answers
     if len(plan_tables) >= 2 and filter_values:
         for val in filter_values:
+            if val.lower() in resolved_tokens:
+                logger.info(f"Skipping ambiguity check for '{val}' — already resolved by user")
+                continue
             clar = await detect_ambiguous_value(val, plan_tables, schema_graph)
             if clar and user_mentioned_tables:
                 # If ambiguous matches span user-mentioned and non-mentioned tables,

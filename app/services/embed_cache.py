@@ -10,7 +10,11 @@ logger = logging.getLogger(__name__)
 
 # ── L1: In-process LRU cache (up to 1000 entries) ─────
 _L1_CACHE: dict[str, list[float]] = {}
-_L1_MAX_SIZE = 1000
+
+
+def _l1_max_size() -> int:
+    from app.config import get_settings
+    return get_settings().EMBED_CACHE_L1_MAX_SIZE
 
 
 def _text_hash(text: str) -> str:
@@ -24,7 +28,7 @@ def _l1_get(text_hash: str) -> list[float] | None:
 
 def _l1_set(text_hash: str, embedding: list[float]):
     """Store in L1 in-memory cache with LRU eviction."""
-    if len(_L1_CACHE) >= _L1_MAX_SIZE:
+    if len(_L1_CACHE) >= _l1_max_size():
         # Evict oldest entry (FIFO approximation)
         oldest_key = next(iter(_L1_CACHE))
         del _L1_CACHE[oldest_key]

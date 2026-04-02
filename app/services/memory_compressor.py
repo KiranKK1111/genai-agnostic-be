@@ -4,14 +4,13 @@ from app.services.llm_client import chat
 
 logger = logging.getLogger(__name__)
 
-COMPRESS_THRESHOLD = 10  # Compress when history exceeds this many turns
-
-
 async def maybe_compress(session_state: dict) -> dict:
     """Compress old history turns into a summary if threshold exceeded.
     Returns the (potentially modified) session state."""
+    from app.config import get_settings
+    compress_threshold = getattr(get_settings(), "HISTORY_COMPRESS_THRESHOLD", 10)
     history = session_state.get("history", [])
-    if len(history) <= COMPRESS_THRESHOLD:
+    if len(history) <= compress_threshold:
         return session_state
 
     # Compress turns 0..(N-5) into a summary, keep last 5 verbatim

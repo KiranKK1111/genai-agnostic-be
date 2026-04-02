@@ -79,6 +79,15 @@ async def _watch_loop():
 
             await seed_all(graph)
 
+            # Run drift check (Stage 30) after re-seeding
+            from app.services.drift_monitor import run_full_drift_check
+            try:
+                drift_report = await run_full_drift_check(graph)
+                if drift_report.get("status") == "DEGRADED":
+                    logger.warning(f"Schema watcher: embedding quality degraded after refresh")
+            except Exception as e:
+                logger.debug(f"Drift check skipped: {e}")
+
             logger.info(f"Schema watcher: refreshed ({len(graph.tables)} tables)")
         except Exception as e:
             logger.error(f"Schema watcher error: {e}")

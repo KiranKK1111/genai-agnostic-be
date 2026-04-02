@@ -15,7 +15,7 @@ async def create_pool() -> asyncpg.Pool:
         dsn=settings.dsn,
         min_size=settings.DB_POOL_MIN,
         max_size=settings.DB_POOL_MAX,
-        command_timeout=60,
+        command_timeout=settings.DB_COMMAND_TIMEOUT,
     )
     logger.info(f"Database pool created: {settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}")
     return _pool
