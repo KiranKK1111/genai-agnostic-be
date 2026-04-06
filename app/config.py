@@ -28,8 +28,8 @@ class Settings(BaseSettings):
     # ── Embeddings ───────────────────────────────────────
     EMBEDDING_MODEL: str = "local-sentence-encoder"
     EMBEDDING_DIMENSIONS: int = 384
-    EMBEDDING_QUERY_IDF_BOOST: float = 1.3    # Asymmetric: boost rare terms for queries
-    EMBEDDING_DOC_IDF_DAMPEN: float = 0.85    # Asymmetric: dampen for documents
+    EMBEDDING_QUERY_IDF_BOOST: float = 1.0    # Neutral: equal IDF weighting for queries
+    EMBEDDING_DOC_IDF_DAMPEN: float = 1.0     # Neutral: equal IDF weighting for documents
     EMBED_CACHE_L1_MAX_SIZE: int = 1000       # In-memory embedding cache entries
 
     # ── Auth ───────────────────────────────────────────────
@@ -75,8 +75,8 @@ class Settings(BaseSettings):
     BM25_B: float = 0.75                      # Document length normalization
 
     # ── Hybrid Search ──────────────────────────────────────
-    HYBRID_DENSE_WEIGHT: float = 0.6          # RRF weight for dense (FAISS) results
-    HYBRID_RETRIEVAL_K: int = 20              # Candidates per source before fusion
+    HYBRID_DENSE_WEIGHT: float = 0.5          # RRF weight: equal dense/sparse balance
+    HYBRID_RETRIEVAL_K: int = 50              # Candidates per source before fusion
 
     # ── Similarity & Matching ──────────────────────────────
     AMBIGUITY_GAP: float = 0.12              # Top-2 score gap below which = ambiguous
@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     NEURAL_TRAIN_EPOCHS: int = 50           # Max contrastive training epochs (early stopping)
     NEURAL_TRAIN_LR: float = 0.0003         # Adam learning rate (lower = more stable)
     NEURAL_TRAIN_BATCH_SIZE: int = 16       # Training batch size
-    NEURAL_TRAIN_PAIRS: int = 50            # LLM-generated training pairs
+    NEURAL_TRAIN_PAIRS: int = 100           # LLM-generated training pairs
 
     # ── Drift Monitoring ───────────────────────────────────
     DRIFT_ALERT_THRESHOLD: float = 0.15      # Similarity distribution shift threshold

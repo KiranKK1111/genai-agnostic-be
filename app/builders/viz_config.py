@@ -104,6 +104,23 @@ def axis_specific_clarification(columns: list[dict]) -> dict:
     }
 
 
+def filter_criteria_clarification(columns: list[str], table_name: str = "") -> dict:
+    """Build filter criteria clarification payload (text input).
+    Shown when the user asks a vague filter question like 'filter by criteria'."""
+    friendly_cols = [c.replace("_", " ").title() for c in columns]
+    col_list = ", ".join(friendly_cols[:10])
+    hint = f"Available fields: {col_list}" if friendly_cols else ""
+    return {
+        "type": "filter_criteria",
+        "mode": "text_input",
+        "support_for_custom_replies": True,
+        "question": "What criteria would you like to filter by?",
+        "placeholder": "e.g., country is India, balance above 50000, city is Mumbai",
+        "hint": hint,
+        "options": [],
+    }
+
+
 def record_limit_clarification(total_rows: int, limit: int) -> dict:
     """Build record limit clarification payload (single_select).
     When total_rows exceeds MAX_POPULATE_ROWS, the 'all' option is capped

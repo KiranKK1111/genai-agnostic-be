@@ -282,6 +282,17 @@ how many loans | loans
 
 Generate the list now:"""}], temperature=0.7)
 
+        # Build flexible lookup: map lowered names AND suffix parts to actual table names
+        # e.g., "erp_customers" → matches "erp_customers", "customers"
+        table_lookup: dict[str, str] = {}
+        for tl in table_list:
+            table_lookup[tl.lower()] = tl
+            # Also allow matching by suffix after last underscore (e.g., "customers" → "erp_customers")
+            if "_" in tl:
+                suffix = tl.lower().rsplit("_", 1)[-1]
+                if suffix not in table_lookup:  # don't overwrite exact matches
+                    table_lookup[suffix] = tl
+
         # Parse "query | table" format (more reliable than JSON for smaller models)
         result = {"pairs": []}
         for line in raw_response.strip().split("\n"):
@@ -289,9 +300,10 @@ Generate the list now:"""}], temperature=0.7)
                 parts = line.split("|", 1)
                 if len(parts) == 2:
                     q = parts[0].strip().strip("-").strip("0123456789.").strip()
-                    t = parts[1].strip().lower()
-                    if q and t in [tl.lower() for tl in table_list]:
-                        result["pairs"].append({"query": q, "target": t})
+                    t = parts[1].strip().lower().strip()
+                    resolved = table_lookup.get(t)
+                    if q and resolved:
+                        result["pairs"].append({"query": q, "target": resolved})
 
         raw_pairs = result.get("pairs", [])
         for p in raw_pairs:
@@ -301,11 +313,10 @@ Generate the list now:"""}], temperature=0.7)
                 continue
 
             # Resolve target to the enriched schema text
-            target_table = target.split(".")[0]
-            if target_table in graph.tables:
-                tmeta = graph.tables[target_table]
+            if target in graph.tables:
+                tmeta = graph.tables[target]
                 col_names = ", ".join(tmeta.columns.keys())
-                positive = f"table {target_table}: {col_names}"
+                positive = f"table {target}: {col_names}"
                 if tmeta.description:
                     positive += f". {tmeta.description}"
                 pairs.append((query, positive))

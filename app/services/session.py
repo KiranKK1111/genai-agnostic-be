@@ -26,7 +26,9 @@ def new_session_state(session_id: str, user_id: str = None) -> dict:
         "last_table": None,
         "last_intent": None,
         "intent_chain": [],
-        "file_context": None,
+        "sql_history": [],          # Recent DB queries: [{sql, message, tables, is_follow_up}]
+        "file_context": None,           # Active file: {file_name, chunk_count, session_id}
+        "file_history": [],             # All uploaded files: [{file_name, chunk_count, session_id, upload_message}]
         "clarification_pending": None,
         "clarification_history": [],   # Accumulated Q&A pairs across chained clarifications
         "cancel_requested": False,

@@ -14,6 +14,54 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+async def _select_base_query(
+    follow_up: str, sql_history: list[dict], session_state: dict, schema_graph: SchemaGraph
+) -> tuple[str, dict]:
+    """Given a follow-up message and query history, pick the best base query to amend.
+
+    Example: If user asks about "customers in visakhapatnam" after queries:
+      Q1: SELECT * FROM erp.erp_customers;                    ("get me all customers")
+      Q2: SELECT * FROM erp.erp_customers WHERE state='AP';   ("what about those in AP")
+      Q3: SELECT c.* FROM erp.erp_customers c JOIN erp.cart.. ("clients with 5+ cart items")
+
+    The LLM should pick Q2 as the best base because visakhapatnam is a city in AP,
+    so adding a city filter to Q2 makes more semantic sense than amending Q3.
+    """
+    from app.services.llm_client import chat_json
+
+    # Build a numbered list of recent queries for the LLM
+    history_lines = []
+    for i, entry in enumerate(sql_history):
+        msg = entry.get("message", "")
+        sql = entry.get("sql", "")
+        tables = ", ".join(entry.get("tables", []))
+        history_lines.append(f"  Q{i+1}. \"{msg}\" → {sql}")
+
+    history_text = "\n".join(history_lines)
+
+    try:
+        result = await chat_json([{"role": "user", "content":
+            f'The user is asking a follow-up question about previous database queries.\n\n'
+            f'Query history (oldest to newest):\n{history_text}\n\n'
+            f'New follow-up: "{follow_up}"\n\n'
+            f'Which previous query is the BEST BASE to amend for this follow-up?\n'
+            f'Think about semantic relationships:\n'
+            f'- If the follow-up adds a filter, which query has the right scope?\n'
+            f'- If the follow-up narrows down results, which query is the right starting point?\n'
+            f'- A city filter should build on a state/region query, not a JOIN query about a different topic\n'
+            f'- "what about X" usually refers to the most recent query with a matching context\n\n'
+            f'Return JSON: {{"query_number": <1-based index>, "reason": "brief explanation"}}'}])
+        chosen = result.get("query_number", len(sql_history))
+        idx = max(0, min(chosen - 1, len(sql_history) - 1))
+        logger.info(f"Base query selection: chose Q{idx+1} ({result.get('reason', '')})")
+    except Exception as e:
+        logger.warning(f"Base query selection failed: {e}, using last query")
+        idx = len(sql_history) - 1
+
+    entry = sql_history[idx]
+    return entry["sql"], session_state.get("last_plan", {})
+
+
 async def execute_db_query(message: str, session_state: dict, schema_graph: SchemaGraph,
                            is_follow_up: bool = False, user_name: str = "User"):
     """Execute the DB analysis pipeline. Yields SSE events."""
@@ -23,15 +71,52 @@ async def execute_db_query(message: str, session_state: dict, schema_graph: Sche
     yield {"type": "step", "step_number": 1, "label": "Understanding your question..."}
 
     if is_follow_up and session_state.get("last_sql"):
-        # ── Follow-up: Amend existing SQL ──────────────────
+        # ── Follow-up: Pick best base query from history, then amend ──
         import re as _re
-        # Strip LIMIT from previous SQL so the LLM works with the clean base query
-        base_sql = _re.sub(r"\s*LIMIT\s+\d+", "", session_state["last_sql"], flags=_re.IGNORECASE)
-        base_sql = base_sql.strip().rstrip(";") + ";"
-        logger.info(f"Follow-up amend: original_sql={base_sql!r}, message={message!r}")
+
+        # Detect vague/open-ended filter requests — ask for specific criteria
+        # instead of generating a bad SQL query from a vague question
+        vague_filter = _re.search(
+            r"\b(filter|narrow|refine|specific\s+criteria|certain\s+criteria|"
+            r"would you like.*filter|filter.*by.*criteria|"
+            r"based on.*criteria|by.*specific)\b",
+            message, _re.IGNORECASE
+        )
+        # Only treat as vague if the message does NOT contain a concrete value/column
+        # e.g. "filter by country India" is specific, "filter by specific criteria" is vague
+        has_concrete_value = bool(_re.search(
+            r"\b(=|is|equals|above|below|greater|less|more|than|in\s+\w{3,}|where)\b",
+            message, _re.IGNORECASE
+        ))
+        if vague_filter and not has_concrete_value:
+            columns = session_state.get("last_columns", [])
+            table_name = session_state.get("last_table", "")
+            from app.builders.viz_config import filter_criteria_clarification
+            clar = filter_criteria_clarification(columns, table_name)
+            yield {"type": "clarification", "clarification": clar}
+            session_state["clarification_pending"] = {
+                "type": "filter_criteria",
+                "message": session_state.get("last_sql", ""),  # store the SQL to amend
+                "original_user_message": message,
+            }
+            return
+
         yield {"type": "step", "step_number": 2, "label": "Analyzing follow-up context..."}
-        sql = await amend_sql(base_sql, message, None, schema_graph)
+
+        base_sql = session_state["last_sql"]
         plan_dict = session_state.get("last_plan", {})
+
+        # If we have query history, ask LLM which query is the best base
+        sql_history = session_state.get("sql_history", [])
+        if len(sql_history) > 1:
+            base_sql, plan_dict = await _select_base_query(message, sql_history, session_state, schema_graph)
+
+        # Strip LIMIT from chosen base so the LLM works with the clean query
+        base_sql = _re.sub(r"\s*LIMIT\s+\d+", "", base_sql, flags=_re.IGNORECASE)
+        base_sql = base_sql.strip().rstrip(";") + ";"
+        logger.info(f"Follow-up amend: base_sql={base_sql!r}, message={message!r}")
+        sql = await amend_sql(base_sql, message, None, schema_graph)
+        plan_dict = plan_dict
     else:
         # ── New query: Full 8-stage pipeline ───────────────
         yield {"type": "step", "step_number": 2, "label": "Analyzing database schema..."}
@@ -114,8 +199,9 @@ Do NOT reveal any internal details like table names, column names, or schema str
         logger.debug(f"EXPLAIN validation skipped: {e}")
 
     # ── Stage 8a-ii: Pre-execution record limit check ─────
-    # If EXPLAIN estimates more rows than the threshold, get the exact count
-    # and ask the user BEFORE executing (prevents timeout on massive queries)
+    # If EXPLAIN estimates more rows than the threshold, get the exact count.
+    # Only ask record_limit clarification for >= 5000 rows.
+    # For < 5000 rows, skip the limit question (will ask viz_type after execution).
     if not is_aggregation and estimated_rows and estimated_rows > settings.RECORD_WARN_THRESHOLD:
         # Get exact count instead of using EXPLAIN estimate
         import re as _re_count
@@ -133,7 +219,9 @@ Do NOT reveal any internal details like table names, column names, or schema str
         except Exception:
             exact_count = estimated_rows
 
-        if exact_count > settings.RECORD_WARN_THRESHOLD:
+        # > 5000: ask record_limit (large dataset needs user confirmation)
+        # <= 5000: skip limit question, let post-execution handle viz_type
+        if exact_count > 5000:
             from app.builders.viz_config import record_limit_clarification
             clar = record_limit_clarification(exact_count, settings.RECORD_WARN_THRESHOLD)
             yield {"type": "clarification", "clarification": clar}
@@ -186,9 +274,10 @@ Rules:
 - Only JOIN tables that have matching FK columns
 - Return ONLY the corrected SQL, no explanation"""
         try:
-            from app.services.query_planner import _extract_sql
+            from app.services.query_planner import _extract_sql, _ensure_schema_prefix
             fixed_sql = await llm_chat([{"role": "user", "content": retry_prompt}], temperature=0.1)
             fixed_sql = _extract_sql(fixed_sql)
+            fixed_sql = _ensure_schema_prefix(fixed_sql, schema, set(schema_graph.tables.keys()))
             logger.info(f"Retry SQL: {fixed_sql}")
             result = await execute_sql(fixed_sql)
             if "error" not in result:
@@ -219,27 +308,29 @@ Rules:
         ]}
         return
 
-    # Skip record limit and viz clarifications for aggregation queries
+    # ── Clarification logic for non-aggregation queries ──────
+    # <= 5000 rows: skip record_limit, ask viz_type directly (new OR follow-up)
+    # > 5000 rows: ask record_limit first (user must confirm large loads)
     if not is_aggregation:
-        # Record count check (applies to both new queries and follow-ups)
-        if db_total_count > settings.RECORD_WARN_THRESHOLD:
+        if db_total_count > 5000:
             from app.builders.viz_config import record_limit_clarification
             clar = record_limit_clarification(db_total_count, settings.RECORD_WARN_THRESHOLD)
             yield {"type": "clarification", "clarification": clar}
             session_state["clarification_pending"] = {"type": "record_limit", "sql": sql, "plan": plan_dict, "message": message}
             return
 
-    # Update session
-    await _update_session(session_state, sql, plan_dict, rows, columns, schema_graph)
-    session_state["last_row_count"] = row_count
-
-    # Ask viz type for follow-ups (skip for aggregation queries)
-    if is_follow_up and not is_aggregation:
+        # <= 5000 rows: save session and ask viz_type
+        await _update_session(session_state, sql, plan_dict, rows, columns, schema_graph, message)
+        session_state["last_row_count"] = row_count
         from app.builders.viz_config import viz_type_clarification
         viz_clar = viz_type_clarification(columns)
         yield {"type": "clarification", "clarification": viz_clar}
         session_state["clarification_pending"] = {"type": "viz_type", "message": message}
         return
+
+    # Aggregation queries — no clarification needed, just update session
+    await _update_session(session_state, sql, plan_dict, rows, columns, schema_graph, message)
+    session_state["last_row_count"] = row_count
 
     # Generate response text
     yield {"type": "step", "step_number": 7, "label": "Preparing response..."}
@@ -360,7 +451,7 @@ async def execute_db_query_with_sql(sql: str, plan_dict: dict, message: str,
     # The full dataset goes to the frontend via the data event, but only a
     # subset is kept in session for follow-up context.
     session_rows = rows[:200]
-    await _update_session(session_state, sql, plan_dict, session_rows, columns, schema_graph)
+    await _update_session(session_state, sql, plan_dict, session_rows, columns, schema_graph, message)
     session_state["last_row_count"] = row_count
 
     # Show only the viz type clarification — no data, no summary
@@ -370,7 +461,7 @@ async def execute_db_query_with_sql(sql: str, plan_dict: dict, message: str,
     session_state["clarification_pending"] = {"type": "viz_type", "message": message}
 
 
-async def _update_session(state, sql, plan, rows, columns, schema_graph):
+async def _update_session(state, sql, plan, rows, columns, schema_graph, message: str = ""):
     state["last_sql"] = sql
     state["last_plan"] = plan
     # Serialize rows so they are JSON-safe (date/datetime → str)
@@ -384,7 +475,25 @@ async def _update_session(state, sql, plan, rows, columns, schema_graph):
     state["last_data"] = serialized
     state["last_columns"] = columns
     # Extract primary table
+    primary_table = None
     for tname in schema_graph.tables:
         if tname in sql.lower():
             state["last_table"] = tname
+            if primary_table is None:
+                primary_table = tname
             break
+
+    # Append to sql_history so follow-ups can pick the best base query
+    import re as _re_hist
+    tables_in_sql = [t for t in schema_graph.tables if t in sql.lower()]
+    has_join = bool(_re_hist.search(r"\bJOIN\b", sql, _re_hist.IGNORECASE))
+    history = state.get("sql_history", [])
+    history.append({
+        "sql": sql,
+        "message": message,
+        "tables": tables_in_sql,
+        "has_join": has_join,
+        "columns": columns,
+    })
+    # Keep last 10 queries
+    state["sql_history"] = history[-10:]

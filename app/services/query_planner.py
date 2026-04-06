@@ -67,6 +67,33 @@ def _extract_sql(text: str) -> str:
             text = match.group(1).strip()
     return text.rstrip(";") + ";"
 
+
+def _ensure_schema_prefix(sql: str, schema: str, known_tables: set[str]) -> str:
+    """Deterministically prefix bare table names with the schema.
+
+    LLMs (especially smaller ones like llama3.1) often ignore the instruction
+    to prefix tables with the schema. This fixes it post-hoc by scanning the
+    SQL for any known table name that isn't already prefixed with 'schema.'.
+
+    Example:
+        "FROM erp_customers AS t1" → "FROM erp.erp_customers AS t1"
+    """
+    if not known_tables or not schema:
+        return sql
+
+    for table in sorted(known_tables, key=len, reverse=True):
+        # Match bare table name NOT already preceded by 'schema.'
+        # Handles: FROM table, JOIN table, FROM table AS, etc.
+        pattern = re.compile(
+            r'(?<!' + re.escape(schema) + r'\.)' +     # negative lookbehind: not already prefixed
+            r'\b(' + re.escape(table) + r')\b' +        # the table name
+            r'(?!\s*\.)',                                # not followed by '.' (not a schema ref itself)
+            re.IGNORECASE
+        )
+        sql = pattern.sub(f'{schema}.{table}', sql)
+
+    return sql
+
 # Load spaCy model for NER-based entity extraction (Stage 1)
 try:
     import spacy
@@ -818,7 +845,11 @@ Table context:{column_hint}
 Rules: SELECT only. Prefix tables with {schema}. Use unique lowercase aliases. Use exact column/table names from plan. No SQL comments."""
 
     sql = await chat([{"role": "user", "content": prompt}], temperature=0.1)
-    return _extract_sql(sql)
+    sql = _extract_sql(sql)
+    # Deterministically ensure schema prefix (LLM often forgets it)
+    if schema_graph:
+        sql = _ensure_schema_prefix(sql, schema, set(schema_graph.tables.keys()))
+    return sql
 
 
 async def amend_sql(original_sql: str, follow_up: str, plan: QueryPlan, schema_graph: SchemaGraph) -> str:
@@ -1026,6 +1057,9 @@ Rules:
 
     amended = await chat([{"role": "user", "content": prompt}], temperature=0.1)
     amended = _extract_sql(amended)
+
+    # Ensure schema prefix survived the LLM amendment
+    amended = _ensure_schema_prefix(amended, schema_prefix, set(schema_graph.tables.keys()))
 
     # ── Pass 3: Ground new string literals against DB ──────
     amended = await ground_sql_literals(amended, schema_graph)

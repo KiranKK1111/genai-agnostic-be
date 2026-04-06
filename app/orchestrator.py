@@ -252,6 +252,19 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             yield {"type": "text_done", "content": "I don't have previous data to visualize. Please run a query first."}
             full_text = "I don't have previous data to visualize."
 
+    elif intent == "DUAL_SEARCH":
+        # Both file and DB indexes matched — ask user which source they mean
+        from app.pipelines.intent import source_clarification
+        file_history = state.get("file_history", [])
+        file_names = [f.get("file_name", "uploaded file") for f in file_history] if file_history else [state.get("file_context", {}).get("file_name", "uploaded file")]
+        clar = source_clarification(file_names)
+        clar_event = {"type": "clarification", "clarification": clar}
+        all_events.append(("clarification", clar_event))
+        yield clar_event
+        state["clarification_pending"] = {
+            "type": "source_clarification", "message": message,
+        }
+
     elif intent == "HYBRID":
         async for event in execute_hybrid(message, state):
             etype = event.get("type")
@@ -276,6 +289,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 "record_limit": "limited",
                 "viz_type": "table",
                 "axis_mode": "on_the_fly",
+                "source_clarification": "database",  # default to DB when skipped
+                "filter_criteria": None,   # no sensible default — user must type criteria
                 "ambiguous_table": None,   # no sensible default — fall through
                 "ambiguous_column": None,
                 "ambiguous_value": None,
@@ -490,6 +505,57 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                                        user_prompt=original_message, intent=intent,
                                        status="ERROR", error=event.get("message"))
                 handled = True
+
+        if not handled and clar_type == "filter_criteria":
+            # User typed filter criteria (e.g. "country is India, balance > 50000")
+            # Use their reply as a concrete follow-up to amend the stored SQL
+            filter_text = selected if isinstance(selected, str) and selected else message
+            stored_sql = pending.get("message", "")  # stored the SQL to amend
+            if stored_sql and _schema_graph:
+                # Treat the user's criteria as a follow-up amendment
+                clarified_message = f"filter where {filter_text}"
+                async for event in execute_db_query(clarified_message, state, _schema_graph,
+                                                    is_follow_up=True, user_name=user_name):
+                    etype = event.get("type")
+                    all_events.append((etype, event))
+                    yield event
+                    if etype == "text_done":
+                        full_text = event.get("content", "")
+            else:
+                yield {"type": "text_done", "content": "I couldn't process the filter. Could you try rephrasing?"}
+                full_text = "I couldn't process the filter."
+            handled = True
+
+        if not handled and clar_type == "source_clarification":
+            # User chose file or database — route the original message to the right pipeline
+            source = selected if isinstance(selected, str) else "database"
+            if not source:
+                # Extract from free-text reply
+                msg_lower = message.strip().lower()
+                if any(w in msg_lower for w in ("file", "upload", "document")):
+                    source = "file"
+                else:
+                    source = "database"
+            if source == "file":
+                async for event in execute_file_followup(original_message, state):
+                    etype = event.get("type")
+                    all_events.append((etype, event))
+                    yield event
+                    if etype == "text_done":
+                        full_text = event.get("content", "")
+            else:
+                if _schema_graph:
+                    async for event in execute_db_query(original_message, state, _schema_graph,
+                                                        is_follow_up=False, user_name=user_name):
+                        etype = event.get("type")
+                        all_events.append((etype, event))
+                        yield event
+                        if etype == "text_done":
+                            full_text = event.get("content", "")
+                else:
+                    yield {"type": "text_done", "content": "I couldn't process that. Could you try rephrasing your question?"}
+                    full_text = "I couldn't process that."
+            handled = True
 
         if not handled:
             # Custom text reply — combine original query with user's clarification

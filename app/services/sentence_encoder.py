@@ -38,11 +38,24 @@ logger = logging.getLogger(__name__)
 # "customers" → ["customers", "#cus", "#ust", "#sto", "#tom", "#ome", "#mer", "#ers"]
 
 def _tokenize(text: str) -> list[str]:
-    """Subword-like tokenization: word unigrams + character trigrams."""
+    """Subword-like tokenization: word unigrams + sub-words + character trigrams.
+
+    Compound tokens containing underscores (e.g. 'erp_customers') are split
+    into parts ('erp', 'customers') IN ADDITION to keeping the original.
+    This ensures queries ("erp customers") share word tokens with corpus
+    entries ("erp_customers") — without this, overlap is zero.
+    """
     text = text.lower().strip()
     words = re.findall(r"[a-z0-9_]+", text)
-    tokens = list(words)
+    tokens = []
     for word in words:
+        tokens.append(word)
+        # Split compound tokens on underscores so both parts become searchable
+        if "_" in word:
+            parts = [p for p in word.split("_") if p]
+            if len(parts) > 1:
+                tokens.extend(parts)
+        # Character trigrams for morphological similarity
         if len(word) >= 3:
             for i in range(len(word) - 2):
                 tokens.append(f"#{word[i:i+3]}")

@@ -167,12 +167,15 @@ def _collect_schema_texts(
 
     for tname, tmeta in graph.tables.items():
         col_names = ", ".join(tmeta.columns.keys())
+        # Readable name: "erp_customers" → "erp customers" for query matching
+        tname_readable = tname.replace("_", " ")
 
         # Enrich table text with:
-        # 1. LLM description (e.g., "stores customer profile information")
-        # 2. Domain synonyms (e.g., "client, patron, acct_holder")
-        # 3. Semantic expansions (e.g., "bank account, financial, deposit")
-        parts = [f"table {tname}: {col_names}"]
+        # 1. Readable name (so "erp customers" matches "erp_customers")
+        # 2. LLM description (e.g., "stores customer profile information")
+        # 3. Domain synonyms (e.g., "client, patron, acct_holder")
+        # 4. Semantic expansions (e.g., "bank account, financial, deposit")
+        parts = [f"table {tname} {tname_readable}: {col_names}"]
         if tmeta.description:
             parts.append(tmeta.description)
         table_syns = reverse_synonyms.get(tname, [])
@@ -193,9 +196,10 @@ def _collect_schema_texts(
             "columns": list(tmeta.columns.keys()),
         })
 
-        # Enrich each column with semantic expansions
+        # Enrich each column with readable names + semantic expansions
         for cname, cinfo in tmeta.columns.items():
-            parts = [f"column {cname} in table {tname}, type {cinfo['data_type']}"]
+            cname_readable = cname.replace("_", " ")
+            parts = [f"column {cname} {cname_readable} in table {tname} {tname_readable}, type {cinfo['data_type']}"]
             col_key = f"{tname}.{cname}"
             col_expansions = expansions.get(col_key, [])
             if col_expansions:
