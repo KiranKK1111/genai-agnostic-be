@@ -49,7 +49,10 @@ async def _select_base_query(
             f'- If the follow-up adds a filter, which query has the right scope?\n'
             f'- If the follow-up narrows down results, which query is the right starting point?\n'
             f'- A city filter should build on a state/region query, not a JOIN query about a different topic\n'
-            f'- "what about X" usually refers to the most recent query with a matching context\n\n'
+            f'- "what about X" usually refers to the most recent query with a matching context\n'
+            f'- If the follow-up is about filtering/refining and is vague (e.g. "filter by criteria"), '
+            f'pick the simplest/broadest query that returns the main dataset (usually a SELECT * without JOINs)\n'
+            f'- Prefer SELECT * queries over COUNT(*) queries when the user wants to filter records\n\n'
             f'Return JSON: {{"query_number": <1-based index>, "reason": "brief explanation"}}'}])
         chosen = result.get("query_number", len(sql_history))
         idx = max(0, min(chosen - 1, len(sql_history) - 1))
@@ -89,15 +92,19 @@ async def execute_db_query(message: str, session_state: dict, schema_graph: Sche
             message, _re.IGNORECASE
         ))
         if vague_filter and not has_concrete_value:
-            columns = session_state.get("last_columns", [])
+            # Use the SQL that generated the follow-up suggestions the user clicked.
+            # This is deterministic — no LLM guessing needed.
+            best_sql = session_state.get("last_follow_up_sql") or session_state.get("last_sql", "")
+            columns = session_state.get("last_follow_up_columns") or session_state.get("last_columns", [])
             table_name = session_state.get("last_table", "")
+
             from app.builders.viz_config import filter_criteria_clarification
             clar = filter_criteria_clarification(columns, table_name)
             yield {"type": "clarification", "clarification": clar}
             session_state["clarification_pending"] = {
                 "type": "filter_criteria",
-                "message": session_state.get("last_sql", ""),  # store the SQL to amend
-                "original_user_message": message,
+                "sql": best_sql,                               # the correct SQL to amend
+                "message": message,                            # original user message
             }
             return
 
@@ -420,6 +427,11 @@ End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUE
     yield {"type": "data", "rows": serializable_rows, "columns": columns,
            "row_count": row_count, "sql": sql}
     yield {"type": "follow_ups", "suggestions": follow_ups}
+
+    # Tag the SQL that generated these follow-ups so vague filter requests
+    # can find the right base query even after other queries run in between
+    session_state["last_follow_up_sql"] = sql
+    session_state["last_follow_up_columns"] = columns
 
     # Title on first message
     if session_state.get("total_turns", 0) == 0:

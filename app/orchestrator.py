@@ -508,11 +508,17 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
 
         if not handled and clar_type == "filter_criteria":
             # User typed filter criteria (e.g. "country is India, balance > 50000")
-            # Use their reply as a concrete follow-up to amend the stored SQL
+            # Amend the stored SQL directly — don't go through _select_base_query
             filter_text = selected if isinstance(selected, str) and selected else message
-            stored_sql = pending.get("message", "")  # stored the SQL to amend
+            stored_sql = pending.get("sql", "")
             if stored_sql and _schema_graph:
-                # Treat the user's criteria as a follow-up amendment
+                # Pin last_sql to the stored SQL so the follow-up path uses it directly
+                # and doesn't pick a different query from history
+                state["last_sql"] = stored_sql
+                # Temporarily set sql_history to just this entry so _select_base_query
+                # returns it without an LLM call
+                saved_history = state.get("sql_history", [])
+                state["sql_history"] = [{"sql": stored_sql, "message": original_message, "tables": [], "has_join": False, "columns": []}]
                 clarified_message = f"filter where {filter_text}"
                 async for event in execute_db_query(clarified_message, state, _schema_graph,
                                                     is_follow_up=True, user_name=user_name):
@@ -521,6 +527,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                     yield event
                     if etype == "text_done":
                         full_text = event.get("content", "")
+                # Restore full history (new query was appended by _update_session)
+                state["sql_history"] = saved_history + [e for e in state.get("sql_history", []) if e not in saved_history]
             else:
                 yield {"type": "text_done", "content": "I couldn't process the filter. Could you try rephrasing?"}
                 full_text = "I couldn't process the filter."
