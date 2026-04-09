@@ -9,7 +9,7 @@ from app.database import create_pool, close_pool, get_pool
 from app.startup_validator import validate_startup, is_llm_available
 from app.services.schema_inspector import inspect_schema
 from app.orchestrator import set_schema_graph
-from app.api import chat, auth, admin
+from app.api import chat, auth, admin, dashboard
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
         logger.info("  ✓ Database tables created/verified")
 
     # Step 3: Run incremental migrations (safe, idempotent)
-    for migration_file in ["fix_feedback_table.sql"]:
+    for migration_file in ["fix_feedback_table.sql", "migrate_pg_search.sql"]:
         mig_path = os.path.join(db_dir, migration_file)
         if os.path.exists(mig_path):
             with open(mig_path, encoding="utf-8") as f:
@@ -67,24 +67,54 @@ async def lifespan(app: FastAPI):
     set_schema_graph(graph)
     logger.info(f"  ✓ Schema loaded: {len(graph.tables)} tables")
 
-    # Seed FAISS + BM25 indexes on every startup.
-    # The TF-IDF+SVD encoder is recomputed from scratch each time (no persisted weights),
-    # so stored vectors from a previous run would be in a different embedding space.
-    # Re-seeding ensures vectors and encoder are always in sync.
-    logger.info("Seeding FAISS + BM25 vector indexes...")
-    from app.services.faiss_manager import load_all_indexes, get_faiss_index, clear_index
+    # Seed vector indexes: check if schema changed since last run.
+    # If unchanged and encoder weights exist on disk, skip re-seeding (fast startup).
+    # If changed, re-seed and save encoder weights for next restart.
+    import hashlib as _hl
     from app.services.schema_seeder import seed_all
-    try:
-        await seed_all(graph)
-        logger.info("  ✓ FAISS indexes seeded (schema_idx + values_idx)")
-    except Exception as e:
-        logger.error(f"  ✗ Seeding failed: {e}")
-        # Fallback: try to load stale vectors (better than nothing)
+    from app.services.sentence_encoder import get_encoder
+
+    # Compute schema fingerprint (tables + columns)
+    schema_parts = sorted(
+        f"{t}:{','.join(sorted(meta.columns.keys()))}"
+        for t, meta in graph.tables.items()
+    )
+    schema_hash = _hl.sha256("|".join(schema_parts).encode()).hexdigest()[:16]
+
+    encoder_path = os.path.join(settings.UPLOAD_DIR, "encoder_weights.npz")
+    hash_path = os.path.join(settings.UPLOAD_DIR, "schema_hash.txt")
+    os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
+
+    # Check if we can skip re-seeding
+    needs_reseed = True
+    if os.path.exists(encoder_path) and os.path.exists(hash_path):
+        with open(hash_path) as f:
+            saved_hash = f.read().strip()
+        if saved_hash == schema_hash:
+            # Schema unchanged — load encoder weights and skip seeding
+            try:
+                enc = get_encoder()
+                enc.load_weights(encoder_path)
+                logger.info(f"  ✓ Encoder loaded from cache (schema hash: {schema_hash})")
+                needs_reseed = False
+            except Exception as e:
+                logger.warning(f"  ⚠ Failed to load cached encoder: {e}")
+
+    if needs_reseed:
+        logger.info("Seeding PostgreSQL vector indexes...")
         try:
-            await load_all_indexes()
-            logger.warning("  ⚠ Loaded stale vectors as fallback")
-        except Exception:
-            pass
+            await seed_all(graph)
+            # Save encoder weights for next startup
+            enc = get_encoder()
+            if enc.is_fitted:
+                enc.save_weights(encoder_path)
+                with open(hash_path, "w") as f:
+                    f.write(schema_hash)
+            logger.info(f"  ✓ Indexes seeded + encoder cached (schema hash: {schema_hash})")
+        except Exception as e:
+            logger.error(f"  ✗ Seeding failed: {e}")
+    else:
+        logger.info("  ✓ Skipped re-seeding (schema unchanged, vectors already in PostgreSQL)")
 
     # Run embedding evaluation (Stage 27) after seeding/loading
     from app.services.embedding_eval import evaluate_retrieval
@@ -159,6 +189,7 @@ app.add_middleware(
 app.include_router(chat.router)
 app.include_router(auth.router)
 app.include_router(admin.router)
+app.include_router(dashboard.router)
 
 
 @app.get("/")

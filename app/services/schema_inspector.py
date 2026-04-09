@@ -319,13 +319,18 @@ async def inspect_schema() -> SchemaGraph:
             if cached and cached["description"]:
                 graph.domain_name = cached["description"]
             else:
-                descriptions = [t.description for t in graph.tables.values() if t.description]
+                # Build rich context: table names + column names + descriptions
+                table_summaries = []
+                for tname, tmeta in graph.tables.items():
+                    cols = ", ".join(list(tmeta.columns.keys())[:10])
+                    desc = f" — {tmeta.description}" if tmeta.description else ""
+                    table_summaries.append(f"  {tname} ({cols}){desc}")
                 schema_hint = schema.replace("_", " ").strip()
                 domain_result = await chat_json([{"role": "user", "content":
-                    f"""What is the specific business domain for a database called "{schema_hint}" with this data?
-{'; '.join(descriptions)}
-Return JSON with a precise single-word domain name: {{"domain": "..."}}
-Be specific: use "Banking" not "Financial", "Healthcare" not "Medical", "Retail" not "Commerce"."""}])
+                    f"""What is the specific business domain for a database schema called "{schema_hint}" with these tables?
+{chr(10).join(table_summaries)}
+Return JSON with a precise domain name (1-3 words): {{"domain": "..."}}
+Be specific. Examples: "Climate Risk", "Supply Chain", "Banking", "Healthcare", "E-Commerce"."""}])
                 graph.domain_name = domain_result.get("domain", schema.split("_")[-1].title())
                 await conn.execute(
                     f"DELETE FROM {app_schema}.schema_index WHERE table_name = '_domain' AND column_name IS NULL"

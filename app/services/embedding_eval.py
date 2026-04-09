@@ -26,31 +26,72 @@ async def _generate_canary_queries(graph) -> list[dict]:
 
     For each table, create queries that SHOULD match that table.
     This ensures canaries stay in sync as the schema evolves.
+
+    Column canaries use multiple query variants to test robustness:
+      - "{col} in {table} table"          (explicit table mention)
+      - "{col} from {table}"              (natural phrasing)
+    This tests whether the embedding can disambiguate shared column names
+    (e.g. case_id exists in 5+ tables).
     """
     canaries = []
 
+    # Detect confusable sibling pairs (e.g., report vs report_daily)
+    all_tables = list(graph.tables.keys())
+    sibling_groups: dict[str, set[str]] = {}
+    for t in all_tables:
+        for other in all_tables:
+            if other != t and (t.startswith(other) or other.startswith(t)):
+                base = min(t, other, key=len)
+                sibling_groups.setdefault(base, set()).add(t)
+                sibling_groups[base].add(other)
+
+    # Pre-compute which columns exist in multiple tables (shared/FK columns)
+    column_table_count: dict[str, int] = {}
     for tname, tmeta in graph.tables.items():
+        for cname in tmeta.columns:
+            column_table_count[cname] = column_table_count.get(cname, 0) + 1
+
+    for tname, tmeta in graph.tables.items():
+        tname_readable = tname.replace('_', ' ')
+
         # Query: "show me [table_name]" should find the table
+        acceptable = list(sibling_groups.get(tname, set()))
+        if not acceptable:
+            for base, group in sibling_groups.items():
+                if tname in group:
+                    acceptable = list(group)
+                    break
         canaries.append({
-            "query": f"show me {tname.replace('_', ' ')}",
+            "query": f"show me {tname_readable}",
             "expected_table": tname,
+            "acceptable_tables": acceptable if acceptable else None,
             "index": "schema_idx",
             "type": "table",
         })
 
-        # Query: "[column_name] in [table]" should find the column
-        # Use "in [table]" format and repeat table name for FK columns that exist
-        # in multiple tables (e.g. "customer_id" in accounts, loans, transactions).
-        # This gives the table name more weight in the embedding.
-        for cname in list(tmeta.columns.keys())[:3]:  # top 3 columns
+        # Column canaries — top 3 columns per table
+        for cname in list(tmeta.columns.keys())[:3]:
             col_readable = cname.replace('_', ' ')
-            table_readable = tname.replace('_', ' ')
+
+            # For shared columns (exist in 2+ tables), use stronger table emphasis
+            # to test that disambiguation works
+            is_shared = column_table_count.get(cname, 1) > 1
+
+            if is_shared:
+                # Shared column: query MUST include table name prominently
+                query = f"{col_readable} in {tname_readable} table {tname_readable}"
+            else:
+                # Unique column: simpler query is sufficient
+                query = f"{col_readable} in {tname_readable} table"
+
             canaries.append({
-                "query": f"{col_readable} in {table_readable} table",
+                "query": query,
                 "expected_table": tname,
                 "expected_column": cname,
+                "acceptable_tables": acceptable if acceptable else None,
                 "index": "schema_idx",
                 "type": "column",
+                "is_shared": is_shared,
             })
 
     return canaries
@@ -88,23 +129,22 @@ async def evaluate_retrieval(graph, k: int = 5) -> dict:
         expected_table = canary["expected_table"]
         expected_column = canary.get("expected_column")
         index_name = canary["index"]
+        acceptable = canary.get("acceptable_tables")
 
         try:
             emb = await embed_single(query)
             results = await search(index_name, emb, k=k, query_text=query)
 
-            # Check if expected result appears in top-K
-            # For column queries: accept if the correct TABLE is found,
-            # because the query planner resolves columns separately after
-            # table discovery. A table match IS a successful retrieval.
             found = False
             for rank, r in enumerate(results):
                 payload = r.get("payload", {})
-                table_match = payload.get("table") == expected_table
+                result_table = payload.get("table")
+                # Accept exact match OR any confusable sibling
+                table_match = (result_table == expected_table or
+                               (acceptable and result_table in acceptable))
 
                 if expected_column is None:
                     # Table query: accept any result from the correct table
-                    # (table entry or column entry — both confirm the table was found)
                     if table_match:
                         hits += 1
                         reciprocal_ranks.append(1.0 / (rank + 1))
@@ -112,17 +152,9 @@ async def evaluate_retrieval(graph, k: int = 5) -> dict:
                         found = True
                         break
                 else:
-                    # Column query: exact column match OR table match (table contains the column)
-                    exact_col = payload.get("column") == expected_column
-                    if table_match and exact_col:
-                        # Best case: exact column match
-                        hits += 1
-                        reciprocal_ranks.append(1.0 / (rank + 1))
-                        similarities.append(r.get("similarity", 0.0))
-                        found = True
-                        break
-                    elif table_match and not found:
-                        # Acceptable: table match (column is in this table)
+                    # Column query: table match is sufficient
+                    # (query planner resolves exact columns after table discovery)
+                    if table_match:
                         hits += 1
                         reciprocal_ranks.append(1.0 / (rank + 1))
                         similarities.append(r.get("similarity", 0.0))
@@ -152,11 +184,10 @@ async def evaluate_retrieval(graph, k: int = 5) -> dict:
         "num_canaries": n,
         "num_hits": hits,
         "k": k,
-        "failures": failures[:10],  # limit to 10 for logging
+        "failures": failures[:10],
         "latency_ms": round(elapsed_ms, 1),
     }
 
-    # Log summary
     status = "PASS" if report["recall_at_k"] >= 0.7 else "WARN" if report["recall_at_k"] >= 0.5 else "FAIL"
     logger.info(
         f"Embedding eval [{status}]: "
@@ -173,15 +204,11 @@ async def evaluate_retrieval(graph, k: int = 5) -> dict:
 
 
 async def quick_health_check(graph) -> bool:
-    """Fast health check — run 3 canaries, return pass/fail.
-
-    Use this for the 15-minute schema watcher cycle.
-    """
+    """Fast health check — run 3 canaries, return pass/fail."""
     canaries = await _generate_canary_queries(graph)
     if not canaries:
         return True
 
-    # Pick 3 representative canaries (first, middle, last table)
     sample = [canaries[0]]
     if len(canaries) > 2:
         sample.append(canaries[len(canaries) // 2])

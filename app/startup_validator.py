@@ -47,23 +47,35 @@ async def validate_startup():
         logger.error(f"    Fix: Ensure PostgreSQL is running and check POSTGRES_HOST/PORT/USER/PASSWORD in .env")
         sys.exit(1)
 
-    # 2. Ollama availability (OPTIONAL — warn and continue)
-    logger.info("Checking Ollama availability...")
+    # 2. LLM backend availability (Ollama or vLLM — OPTIONAL, warn and continue)
+    logger.info("Checking LLM backend availability...")
+    api_url = settings.AI_FACTORY_API
     ollama_url = settings.ollama_base_url
     models: list[str] = []
+    backend_type = "unknown"
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{ollama_url}/api/tags")
-            resp.raise_for_status()
-            models = [m["name"] for m in resp.json().get("models", [])]
-            logger.info(f"  ✓ Ollama running at {ollama_url}. Available models: {', '.join(models[:5])}")
+            # Try Ollama-specific endpoint first
+            try:
+                resp = await client.get(f"{ollama_url}/api/tags")
+                resp.raise_for_status()
+                models = [m["name"] for m in resp.json().get("models", [])]
+                backend_type = "Ollama"
+                logger.info(f"  ✓ Ollama running at {ollama_url}. Available models: {', '.join(models[:5])}")
+            except Exception:
+                # Try OpenAI-compatible /v1/models endpoint (vLLM, TGI, etc.)
+                resp = await client.get(f"{api_url}/models")
+                resp.raise_for_status()
+                data = resp.json()
+                models = [m.get("id", "") for m in data.get("data", [])]
+                backend_type = "vLLM/OpenAI-compatible"
+                logger.info(f"  ✓ {backend_type} backend at {api_url}. Available models: {', '.join(models[:5])}")
     except Exception as e:
-        logger.warning(f"  ⚠ Cannot reach Ollama at {ollama_url}")
+        logger.warning(f"  ⚠ Cannot reach LLM backend at {api_url}")
         logger.warning(f"    Error: {e}")
-        logger.warning(f"    LLM chat will be unavailable until Ollama is started: ollama serve")
+        logger.warning(f"    LLM chat will be unavailable until the backend is started.")
         logger.warning(f"    Embeddings are unaffected (local SentenceEncoder).")
         _llm_available = False
-        # Skip model check — no Ollama means no model list
         logger.info(f"  ✓ Embeddings: local SentenceEncoder ({settings.EMBEDDING_DIMENSIONS}d) — no external model")
         return  # Continue startup without LLM
 
@@ -71,13 +83,16 @@ async def validate_startup():
     logger.info("Checking required models...")
     llm_model = settings.AI_FACTORY_MODEL.split(":")[0]
     available = [m.split(":")[0] for m in models]
-    if llm_model not in available:
-        logger.warning(f"  ⚠ Required model '{llm_model}' not found in Ollama")
-        logger.warning(f"    Fix: Run: ollama pull {settings.AI_FACTORY_MODEL}")
-        logger.warning(f"    LLM chat will fail until the model is pulled.")
+    if llm_model not in available and models:
+        logger.warning(f"  ⚠ Required model '{llm_model}' not found in {backend_type}")
+        if backend_type == "Ollama":
+            logger.warning(f"    Fix: Run: ollama pull {settings.AI_FACTORY_MODEL}")
+        else:
+            logger.warning(f"    Available models: {', '.join(models[:5])}")
+        logger.warning(f"    LLM chat may fail if the model name doesn't match.")
         _llm_available = False
     else:
-        logger.info(f"  ✓ LLM model available: {llm_model}")
+        logger.info(f"  ✓ LLM model available: {llm_model} ({backend_type})")
         _llm_available = True
     logger.info(f"  ✓ Embeddings: local SentenceEncoder ({settings.EMBEDDING_DIMENSIONS}d) — no external model")
 

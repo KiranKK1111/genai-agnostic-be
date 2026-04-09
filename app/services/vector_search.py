@@ -1,22 +1,20 @@
-"""Vector search — Hybrid FAISS + BM25 with PostgreSQL persistence.
+"""Vector search — PostgreSQL-native hybrid search (no in-memory indexes).
 
 Architecture:
-    FAISS   → dense embeddings in RAM for semantic similarity search
-    BM25    → sparse term index in RAM for exact keyword matching
-    RRF     → Reciprocal Rank Fusion combines both result sets
-    PostgreSQL → metadata + mappings + search logs + results (source of truth)
+    PostgreSQL → stores embeddings (real[]) + tsvector for keyword search
+    Dense       → dot product on normalized real[] arrays (cosine similarity)
+    Sparse      → tsvector/tsquery full-text search with ts_rank
+    RRF         → Reciprocal Rank Fusion combines both result sets
 
 Flow:
-    Search:  Query → Embedding + Text → Hybrid(FAISS + BM25) → RRF Fusion
-             → Top-K IDs → PostgreSQL metadata
-    Insert:  Embedding → FAISS (memory) + BM25 (memory) + PostgreSQL (persistence)
-    Startup: PostgreSQL → load into FAISS + BM25 indexes
+    Search:  Query → Embedding + Text → PostgreSQL(dense + sparse) → RRF → Top-K
+    Insert:  Embedding → PostgreSQL (L2-normalized)
 """
 import json
 import hashlib
 import logging
 from app.services.faiss_manager import (
-    search_index, add_to_index, clear_index,
+    search_index, add_to_index,
     log_search, get_cached_retrieval, cache_retrieval,
     trace_retrieval,
 )
@@ -29,11 +27,11 @@ logger = logging.getLogger(__name__)
 async def search(index_name: str, query_embedding: list[float], k: int = 5,
                  filter_key: str = None, filter_value: str = None,
                  query_text: str = None) -> list[dict]:
-    """Search using hybrid FAISS+BM25 → fetch metadata from PostgreSQL.
+    """Search using hybrid dense+sparse → fetch metadata from PostgreSQL.
     Returns [{node_id, similarity, payload}].
 
-    If query_text is provided, uses hybrid search (FAISS dense + BM25 sparse).
-    Otherwise falls back to FAISS-only dense search.
+    If query_text is provided, uses hybrid search (dense + sparse).
+    Otherwise falls back to dense-only search.
     """
     if query_text and not filter_key:
         # Hybrid search: combine dense + sparse via RRF
@@ -72,14 +70,14 @@ async def search(index_name: str, query_embedding: list[float], k: int = 5,
             results.sort(key=lambda x: x["similarity"], reverse=True)
             return results[:k]
 
-    # Fallback: FAISS-only dense search
+    # Fallback: dense-only search (already returns full metadata)
     results = await search_index(index_name, query_embedding, k=k,
                                  filter_key=filter_key, filter_value=filter_value)
     return results
 
 
 async def insert_node(index_name: str, embedding: list[float], payload: dict) -> int:
-    """Insert into both FAISS (memory) and PostgreSQL (persistence).
+    """Insert embedding + metadata into PostgreSQL.
     Returns the PostgreSQL metadata ID."""
     content = payload.get("value", "") or payload.get("description", "") or payload.get("table", "")
     metadata_id = await add_to_index(index_name, embedding, payload, content=content)

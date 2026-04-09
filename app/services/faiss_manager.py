@@ -1,20 +1,21 @@
-"""FAISS Index Manager — in-memory vector search with PostgreSQL persistence.
+"""Vector Index Manager — PostgreSQL-native vector search (no in-memory FAISS).
 
 Architecture:
-    FAISS  → stores embeddings (vectors) in RAM for fast similarity search
-    PostgreSQL → stores metadata + mappings + search logs (source of truth)
+    PostgreSQL → stores embeddings (real[]) + tsvector for keyword search
+    Dense search  → dot product on normalized real[] arrays (cosine similarity)
+    Sparse search → tsvector/tsquery full-text search with ts_rank
+    No FAISS, no in-memory indexes — everything fetched dynamically from PostgreSQL.
 
 Flow:
-    User query → Embedding model → FAISS similarity search → Top-K vector IDs
-    → Fetch metadata from PostgreSQL → Return structured response
+    User query → Embedding model → PostgreSQL dot product → Top-K results
+    User query → tsquery → PostgreSQL ts_rank → Top-K results
+    → Reciprocal Rank Fusion → Final ranked results
 """
-import asyncio
 import json
 import time
 import hashlib
 import logging
 import numpy as np
-import faiss
 from typing import Optional
 from app.database import get_pool
 from app.config import get_settings
@@ -22,209 +23,119 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-class FAISSIndex:
-    """Single FAISS index with ID mapping back to PostgreSQL.
+# ── Dense Search (replaces FAISS) ─────────────────────────────
+async def dense_search(index_name: str, query_embedding: list[float], k: int = 5,
+                       filter_key: str = None, filter_value: str = None) -> list[tuple[int, float]]:
+    """Cosine similarity search via PostgreSQL dot product on normalized real[] vectors.
 
-    Thread-safe via asyncio.Lock — all mutations (build/add/clear)
-    are serialized while searches can proceed concurrently.
+    Since vectors are L2-normalized at insert time, dot product = cosine similarity.
+    Returns [(metadata_id, similarity_score)] sorted by similarity descending.
+    """
+    settings = get_settings()
+    pool = get_pool()
+    schema = settings.APP_SCHEMA
+
+    # Build filter clause
+    filter_clause = ""
+    params = [query_embedding, index_name, k * 3 if filter_key else k]
+    if filter_key and filter_value:
+        filter_clause = f"AND payload->>$4 = $5"
+        params.extend([filter_key, filter_value])
+
+    query_sql = f"""
+        SELECT id, payload,
+               (SELECT COALESCE(sum(a * b), 0)
+                FROM unnest(embedding, $1::real[]) AS t(a, b)) AS similarity
+        FROM {schema}.embedding_metadata
+        WHERE index_name = $2 {filter_clause}
+        ORDER BY similarity DESC
+        LIMIT $3
     """
 
-    def __init__(self, index_name: str, dimensions: int = 768):
-        self.index_name = index_name
-        self.dimensions = dimensions
-        self.index: Optional[faiss.IndexFlatIP] = None
-        self.id_map: list[int] = []  # FAISS position → PostgreSQL metadata ID
-        self._initialized = False
-        self._lock = asyncio.Lock()
+    start = time.time()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query_sql, *params)
 
-    def build(self, embeddings: np.ndarray, metadata_ids: list[int]):
-        """Build FAISS index from embeddings. Normalizes vectors for cosine similarity.
-
-        For large indexes (>10K vectors), uses IVF for faster search.
-        """
-        if len(embeddings) == 0:
-            self.index = faiss.IndexFlatIP(self.dimensions)
-            self.id_map = []
-            self._initialized = True
-            return
-
-        # Auto-detect dimensions from actual data if they differ from config
-        actual_dim = embeddings.shape[1] if embeddings.ndim == 2 else self.dimensions
-        if actual_dim != self.dimensions:
-            logger.warning(
-                f"FAISS '{self.index_name}': dimension mismatch — "
-                f"config={self.dimensions}, data={actual_dim}. Using data dimension."
-            )
-            self.dimensions = actual_dim
-
-        # Normalize for cosine similarity (inner product on normalized = cosine)
-        faiss.normalize_L2(embeddings)
-
-        settings = get_settings()
-        n_vectors = len(embeddings)
-
-        # Use IVF for large indexes (configurable threshold)
-        if n_vectors >= settings.FAISS_IVF_THRESHOLD:
-            n_centroids = min(settings.FAISS_IVF_NCENTROIDS, n_vectors // 10)
-            n_centroids = max(n_centroids, 1)
-            quantizer = faiss.IndexFlatIP(self.dimensions)
-            self.index = faiss.IndexIVFFlat(quantizer, self.dimensions, n_centroids, faiss.METRIC_INNER_PRODUCT)
-            self.index.train(embeddings)
-            self.index.nprobe = settings.FAISS_IVF_NPROBE
-            self.index.add(embeddings)
-            logger.info(f"FAISS index '{self.index_name}' built (IVF): {n_vectors} vectors, {n_centroids} centroids")
-        else:
-            self.index = faiss.IndexFlatIP(self.dimensions)
-            self.index.add(embeddings)
-            logger.info(f"FAISS index '{self.index_name}' built (Flat): {n_vectors} vectors")
-
-        self.id_map = list(metadata_ids)
-        self._initialized = True
-
-        # Log memory usage
-        mem_mb = (n_vectors * self.dimensions * 4) / (1024 * 1024)
-        logger.info(f"  Memory estimate: {mem_mb:.1f} MB ({n_vectors} x {self.dimensions} x float32)")
-
-    def add(self, embedding: np.ndarray, metadata_id: int):
-        """Add a single vector to the index."""
-        if not self._initialized:
-            self.index = faiss.IndexFlatIP(self.dimensions)
-            self._initialized = True
-
-        vec = embedding.reshape(1, -1).astype(np.float32)
-        faiss.normalize_L2(vec)
-        self.index.add(vec)
-        self.id_map.append(metadata_id)
-
-    def search(self, query_embedding: list[float], k: int = 5) -> list[tuple[int, float]]:
-        """Search for top-k similar vectors. Returns [(metadata_id, similarity_score)]."""
-        if not self._initialized or self.index.ntotal == 0:
-            return []
-
-        query = np.array([query_embedding], dtype=np.float32)
-        faiss.normalize_L2(query)
-
-        actual_k = min(k, self.index.ntotal)
-        scores, indices = self.index.search(query, actual_k)
-
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx >= 0 and idx < len(self.id_map):
-                results.append((self.id_map[idx], float(score)))
-        return results
-
-    @property
-    def count(self) -> int:
-        return self.index.ntotal if self._initialized and self.index else 0
+    results = [(row["id"], float(row["similarity"])) for row in rows]
+    elapsed_ms = int((time.time() - start) * 1000)
+    logger.debug(f"Dense search '{index_name}': {len(results)} results in {elapsed_ms}ms")
+    return results
 
 
-# ── Global index registry (protected by lock) ─────────
-_indexes: dict[str, FAISSIndex] = {}
-_registry_lock = asyncio.Lock()
+# ── Sparse Search (replaces BM25) ─────────────────────────────
+async def sparse_search(index_name: str, query_text: str, k: int = 5) -> list[tuple[int, float]]:
+    """Full-text keyword search via PostgreSQL tsvector/tsquery.
 
-
-async def get_faiss_index(index_name: str) -> FAISSIndex:
-    """Get or create a FAISS index by name. Thread-safe."""
-    async with _registry_lock:
-        if index_name not in _indexes:
-            settings = get_settings()
-            _indexes[index_name] = FAISSIndex(index_name, settings.EMBEDDING_DIMENSIONS)
-        return _indexes[index_name]
-
-
-async def load_index_from_db(index_name: str):
-    """Load a FAISS index + BM25 index from PostgreSQL embedding_metadata table."""
-    from app.services.bm25_manager import build_bm25_index
+    Uses 'simple' config (no stemming) to match exact tokens — mirrors BM25 behavior.
+    Returns [(metadata_id, ts_rank_score)] sorted by rank descending.
+    """
+    if not query_text or not query_text.strip():
+        return []
 
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""SELECT id, embedding, content FROM {schema}.embedding_metadata
-                WHERE index_name = $1 ORDER BY id""",
-            index_name
-        )
+    # Build tsquery: split words and OR them for broad recall
+    tokens = [t.strip() for t in query_text.lower().split() if t.strip()]
+    if not tokens:
+        return []
+    tsquery_str = " | ".join(tokens)
 
-    idx = await get_faiss_index(index_name)
-    async with idx._lock:
-        if not rows:
-            idx.build(np.array([], dtype=np.float32).reshape(0, settings.EMBEDDING_DIMENSIONS), [])
-            logger.info(f"FAISS index '{index_name}': empty (no data in PostgreSQL)")
-            return
-
-        embeddings = np.array([list(r["embedding"]) for r in rows], dtype=np.float32)
-        metadata_ids = [r["id"] for r in rows]
-        contents = [r["content"] or "" for r in rows]
-        idx.build(embeddings, metadata_ids)
-
-        # Build BM25 sparse index alongside FAISS dense index
-        if any(contents):
-            build_bm25_index(index_name, contents, metadata_ids)
-            logger.info(f"BM25 index '{index_name}' built: {len(contents)} docs")
-
-
-async def load_all_indexes():
-    """Load all 3 indexes from PostgreSQL (fallback only).
-
-    NOTE: This is only used as a fallback when re-seeding fails.
-    Normal startup always re-seeds to ensure encoder and vectors are in sync.
+    query_sql = f"""
+        SELECT id, ts_rank(tsv, to_tsquery('simple', $1)) AS rank
+        FROM {schema}.embedding_metadata
+        WHERE index_name = $2 AND tsv @@ to_tsquery('simple', $1)
+        ORDER BY rank DESC
+        LIMIT $3
     """
-    for name in ("schema_idx", "values_idx", "chunks_idx"):
-        await load_index_from_db(name)
 
-    total = 0
-    for name in ("schema_idx", "values_idx", "chunks_idx"):
-        idx = await get_faiss_index(name)
-        total += idx.count
-    logger.info(f"FAISS indexes loaded: {total} total vectors")
+    start = time.time()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(query_sql, tsquery_str, index_name, k)
 
+    results = [(row["id"], float(row["rank"])) for row in rows]
+    elapsed_ms = int((time.time() - start) * 1000)
+    logger.debug(f"Sparse search '{index_name}': {len(results)} results in {elapsed_ms}ms")
+    return results
+
+
+# ── Index Operations (PostgreSQL-only) ────────────────────────
 
 async def add_to_index(index_name: str, embedding: list[float], payload: dict,
                        content: str = "") -> int:
-    """Add a vector to both PostgreSQL (persistence) and FAISS (memory).
+    """Add a vector to PostgreSQL. No in-memory state.
 
-    PostgreSQL is written FIRST (source of truth). FAISS is updated only
-    after the DB write succeeds, preventing desync on DB failures.
-    Returns the PostgreSQL metadata ID.
+    Vectors are L2-normalized before storage so dot product = cosine similarity.
+    The tsvector column is auto-populated by the database trigger.
     """
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
 
-    # Step 1: Persist to PostgreSQL FIRST (source of truth)
+    # L2-normalize before storing
+    vec = np.array(embedding, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm
+    normalized = vec.tolist()
+
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""INSERT INTO {schema}.embedding_metadata
                 (index_name, embedding, payload, content)
                 VALUES ($1, $2, $3::jsonb, $4)
                 RETURNING id""",
-            index_name, embedding, json.dumps(payload), content
+            index_name, normalized, json.dumps(payload), content
         )
-        metadata_id = row["id"]
-
-    # Step 2: Add to FAISS (in-memory) only after DB success
-    idx = await get_faiss_index(index_name)
-    async with idx._lock:
-        vec = np.array(embedding, dtype=np.float32)
-        idx.add(vec, metadata_id)
-
-    # Step 3: Add to BM25 (in-memory) for hybrid search
-    if content:
-        from app.services.bm25_manager import add_to_bm25_index
-        add_to_bm25_index(index_name, content, metadata_id)
-
-    return metadata_id
+    return row["id"]
 
 
 async def batch_add_to_index(index_name: str, embeddings: list[list[float]],
                               payloads: list[dict], contents: list[str] = None) -> list[int]:
-    """Batch-add vectors to both PostgreSQL and FAISS.
+    """Batch-add vectors to PostgreSQL. No in-memory state.
 
-    Much faster than calling add_to_index() in a loop:
-    - Single PostgreSQL transaction for all inserts
-    - Single FAISS index rebuild from all vectors
+    Normalizes vectors and inserts in a single transaction.
     """
     if not embeddings:
         return []
@@ -235,11 +146,17 @@ async def batch_add_to_index(index_name: str, embeddings: list[list[float]],
     if contents is None:
         contents = [""] * len(embeddings)
 
-    # Step 1: Batch insert into PostgreSQL
+    # L2-normalize all vectors
+    arr = np.array(embeddings, dtype=np.float32)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    arr = arr / norms
+    normalized_list = arr.tolist()
+
     metadata_ids = []
     async with pool.acquire() as conn:
         async with conn.transaction():
-            for emb, payload, content in zip(embeddings, payloads, contents):
+            for emb, payload, content in zip(normalized_list, payloads, contents):
                 row = await conn.fetchrow(
                     f"""INSERT INTO {schema}.embedding_metadata
                         (index_name, embedding, payload, content)
@@ -249,80 +166,57 @@ async def batch_add_to_index(index_name: str, embeddings: list[list[float]],
                 )
                 metadata_ids.append(row["id"])
 
-    # Step 2: Batch add to FAISS
-    idx = await get_faiss_index(index_name)
-    async with idx._lock:
-        for emb, mid in zip(embeddings, metadata_ids):
-            vec = np.array(emb, dtype=np.float32)
-            idx.add(vec, mid)
-
-    # Step 3: Add to BM25 for hybrid search
-    from app.services.bm25_manager import add_to_bm25_index
-    for content, mid in zip(contents, metadata_ids):
-        if content:
-            add_to_bm25_index(index_name, content, mid)
-
-    logger.info(f"Batch added {len(metadata_ids)} vectors to '{index_name}' (FAISS + BM25)")
+    logger.info(f"Batch added {len(metadata_ids)} vectors to '{index_name}' (PostgreSQL)")
     return metadata_ids
 
 
 async def search_index(index_name: str, query_embedding: list[float], k: int = 5,
                        filter_key: str = None, filter_value: str = None) -> list[dict]:
-    """Search FAISS index, then fetch metadata from PostgreSQL.
+    """Search PostgreSQL for similar vectors, fetch metadata inline.
 
-    Flow: FAISS search → top-K IDs → PostgreSQL metadata lookup → structured results.
+    Replaces the old FAISS search → PostgreSQL metadata lookup flow.
+    Now everything is a single SQL query.
     """
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
     start_time = time.time()
 
-    idx = await get_faiss_index(index_name)
+    # Build filter clause
+    filter_clause = ""
+    params = [query_embedding, index_name, k * 3 if filter_key else k]
+    if filter_key and filter_value:
+        filter_clause = f"AND payload->>$4 = $5"
+        params.extend([filter_key, filter_value])
 
-    # If filter needed, fetch more candidates and filter post-search
-    search_k = k * 3 if filter_key else k
-    faiss_results = idx.search(query_embedding, k=search_k)
-
-    if not faiss_results:
-        return []
-
-    # Fetch metadata from PostgreSQL
-    metadata_ids = [r[0] for r in faiss_results]
-    scores = {r[0]: r[1] for r in faiss_results}
+    query_sql = f"""
+        SELECT id, payload, content,
+               (SELECT COALESCE(sum(a * b), 0)
+                FROM unnest(embedding, $1::real[]) AS t(a, b)) AS similarity
+        FROM {schema}.embedding_metadata
+        WHERE index_name = $2 {filter_clause}
+        ORDER BY similarity DESC
+        LIMIT $3
+    """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""SELECT id, payload, content FROM {schema}.embedding_metadata
-                WHERE id = ANY($1::int[])""",
-            metadata_ids
-        )
+        rows = await conn.fetch(query_sql, *params)
 
-    # Build results with metadata + similarity scores
     results = []
     for row in rows:
         payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-
-        # Apply filter if specified
-        if filter_key and filter_value:
-            if payload.get(filter_key) != filter_value:
-                continue
-
         results.append({
             "node_id": str(row["id"]),
-            "similarity": scores.get(row["id"], 0.0),
+            "similarity": float(row["similarity"]),
             "payload": payload,
         })
 
-    # Sort by similarity descending, limit to k
-    results.sort(key=lambda x: x["similarity"], reverse=True)
-    results = results[:k]
-
-    # Log the search for audit
     elapsed_ms = int((time.time() - start_time) * 1000)
-    logger.debug(f"FAISS search '{index_name}': {len(results)} results in {elapsed_ms}ms")
-
+    logger.debug(f"PG search '{index_name}': {len(results)} results in {elapsed_ms}ms")
     return results
 
+
+# ── Audit & Cache (unchanged — already PostgreSQL) ────────────
 
 async def log_search(user_query: str, index_name: str, matched_ids: list[int],
                      similarity_scores: list[float] = None):
@@ -428,29 +322,13 @@ async def trace_retrieval(user_query: str, index_name: str, matched_nodes: list[
 
 
 async def clear_index(index_name: str):
-    """Clear a FAISS index, BM25 index, and PostgreSQL metadata. Thread-safe."""
-    from app.services.bm25_manager import clear_bm25_index
-
+    """Clear all vectors for an index from PostgreSQL."""
     settings = get_settings()
     pool = get_pool()
     schema = settings.APP_SCHEMA
-
-    idx = await get_faiss_index(index_name)
-    async with idx._lock:
-        # Clear PostgreSQL
-        async with pool.acquire() as conn:
-            await conn.execute(
-                f"DELETE FROM {schema}.embedding_metadata WHERE index_name = $1",
-                index_name
-            )
-
-        # Reset dimensions from config (in case they were auto-detected from stale data)
-        idx.dimensions = settings.EMBEDDING_DIMENSIONS
-
-        # Rebuild empty FAISS index with correct dimensions
-        idx.build(np.array([], dtype=np.float32).reshape(0, settings.EMBEDDING_DIMENSIONS), [])
-
-    # Clear BM25 sparse index
-    clear_bm25_index(index_name)
-
-    logger.info(f"FAISS + BM25 index '{index_name}' cleared (dim={settings.EMBEDDING_DIMENSIONS})")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"DELETE FROM {schema}.embedding_metadata WHERE index_name = $1",
+            index_name
+        )
+    logger.info(f"Index '{index_name}' cleared (PostgreSQL)")

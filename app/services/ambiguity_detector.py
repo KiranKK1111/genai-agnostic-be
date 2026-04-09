@@ -161,6 +161,62 @@ async def detect_ambiguous_value(value: str, tables: list[str],
     return None
 
 
+async def detect_confusable_tables(plan_tables: list[str],
+                                   schema_graph: SchemaGraph) -> dict | None:
+    """Detect when a resolved table has a sibling with a similar name.
+
+    Example: plan resolves to "questionnaire_report_daily" but
+    "questionnaire_report" also exists — user may have meant either.
+
+    Returns clarification payload if confusable sibling found, None otherwise.
+    """
+    all_tables = set(schema_graph.tables.keys())
+
+    for resolved in plan_tables:
+        # Find sibling tables: tables where one name is a prefix of the other
+        siblings = []
+        for other in all_tables:
+            if other == resolved:
+                continue
+            # Check if one is a prefix/substring of the other
+            if resolved.startswith(other) or other.startswith(resolved):
+                siblings.append(other)
+
+        if not siblings:
+            continue
+
+        # Build clarification options
+        options = []
+        # The "base" table (shorter name) — presented as non-daily/snapshot
+        # The "extended" table (longer name) — presented as daily/refreshing
+        candidates = [resolved] + siblings
+        for tname in sorted(candidates, key=len):
+            tmeta = schema_graph.tables.get(tname)
+            if not tmeta:
+                continue
+            friendly = tname.replace("_", " ").title()
+            desc = tmeta.description if tmeta and tmeta.description else f"{friendly} data"
+            # Detect if this is the "daily" variant
+            is_daily = "daily" in tname or "daily" in (desc or "").lower()
+            options.append({
+                "value": tname,
+                "label": "Interested" if is_daily else "Not Interested",
+                "description": desc,
+            })
+
+        if len(options) >= 2:
+            return {
+                "type": "ambiguous_table",
+                "mode": "single_select",
+                "support_for_custom_replies": False,
+                "question": "Are you willing to view the daily refreshing data?",
+                "options": options,
+                "token": min(candidates, key=len).replace("_", " "),
+            }
+
+    return None
+
+
 async def detect_ambiguities(user_message: str, plan_tables: list[str],
                               filter_values: list[str],
                               schema_graph: SchemaGraph,
@@ -168,9 +224,10 @@ async def detect_ambiguities(user_message: str, plan_tables: list[str],
     """Run all ambiguity checks. Returns first clarification found, or None.
 
     Check order (most impactful first):
-        1. Ambiguous tables
-        2. Ambiguous filter values
-        3. Ambiguous columns
+        1. Confusable sibling tables (e.g., report vs report_daily)
+        2. Ambiguous tables (single token matches 2+ tables)
+        3. Ambiguous filter values
+        4. Ambiguous columns
 
     resolved_ambiguities: list of previously resolved ambiguities to skip
         (prevents re-asking the same question after user already answered)
@@ -179,6 +236,14 @@ async def detect_ambiguities(user_message: str, plan_tables: list[str],
     resolved_ambiguities = resolved_ambiguities or []
     # Build a set of tokens that were already resolved by previous clarifications
     resolved_tokens = {r.get("token", "").lower() for r in resolved_ambiguities if r.get("token")}
+
+    # Check for confusable sibling tables first (e.g., report vs report_daily)
+    # Skip if user already resolved this ambiguity
+    confusable_resolved = any(r.get("type") == "ambiguous_table" for r in resolved_ambiguities)
+    if not confusable_resolved:
+        clar = await detect_confusable_tables(plan_tables, schema_graph)
+        if clar and clar.get("token", "").lower() not in resolved_tokens:
+            return clar
 
     # Extract tokens that might be table references
     tokens = user_message.lower().split()

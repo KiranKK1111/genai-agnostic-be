@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"print\\(''spacy'' in open\\(''/d/SDM GENAI/GENAI/genai-agnostic-be/requirements.txt''\\).read\\(\\).lower\\(\\)\\)\")"
+      "Bash(python3 -c \"print\\(''spacy'' in open\\(''/d/SDM GENAI/GENAI/genai-agnostic-be/requirements.txt''\\).read\\(\\).lower\\(\\)\\)\")",
+      "Read(//d/SDM GENAI/GENAI/genai-agnostic-fe/src/**)",
+      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")"
     ],
     "additionalDirectories": [
       "d:\\SDM GENAI\\GENAI\\genai-agnostic-fe\\src\\components"

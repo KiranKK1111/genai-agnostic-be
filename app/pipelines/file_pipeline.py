@@ -109,7 +109,7 @@ async def execute_file_upload(file_path: str, file_name: str, message: str,
     yield {"type": "text_done", "content": full_text}
     yield {"type": "follow_ups", "suggestions": follow_ups}
 
-    if session_state.get("total_turns", 0) == 0:
+    if session_state.get("_is_first_message", False):
         title = await generate_title(f"File: {file_name}")
         yield {"type": "session_meta", "session_title": title}
         session_state["title"] = title

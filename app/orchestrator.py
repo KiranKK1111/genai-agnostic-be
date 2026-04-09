@@ -104,6 +104,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
 
     # Save user message — skip clarification replies (they are transient UI interactions)
     is_clarification_reply = intent == "CLARIFICATION_REPLY"
+    is_first_message = state.get("total_turns", 0) == 0  # capture BEFORE incrementing
     if not is_clarification_reply:
         user_msg_id = await session_mgr.save_message(session_id, "user", message)
         await session_mgr.append_history(state, "user", message)
@@ -114,6 +115,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
     # NOTE: The SSE consumer (chat.py) does event.pop("type") which mutates the dict.
     # We must capture the event type BEFORE yielding, and store (etype, event) tuples
     # in all_events so the metadata extraction loop can still identify event types.
+    # Set flag so pipelines know whether to generate a title
+    state["_is_first_message"] = is_first_message
     full_text = ""
     all_events = []  # list of (event_type_str, event_dict) tuples
 
@@ -706,6 +709,27 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             )
             await session_mgr.append_history(state, "user", f"[Clarifications] {qa_summary}")
         await session_mgr.append_history(state, "assistant", full_text[:500])
+
+    # Persist session title to DB if a pipeline generated one (first message)
+    # Check multiple sources: session_state["title"], session_meta events, and _is_first_message flag
+    session_title = state.get("title")
+    for etype, ev in all_events:
+        if etype == "session_meta":
+            session_title = ev.get("session_title") or session_title
+    logger.info(f"Title check: state_title='{state.get('title')}', resolved='{session_title}', is_first={is_first_message}, events={[(e, ev.get('session_title','')) for e,ev in all_events if e == 'session_meta']}")
+    if session_title and session_title != "New Chat":
+        try:
+            from app.database import get_pool as _get_pool
+            pool = _get_pool()
+            schema = settings.APP_SCHEMA
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f"UPDATE {schema}.chat_sessions SET title=$1 WHERE id=$2::uuid",
+                    session_title, session_id,
+                )
+            logger.info(f"Session title persisted: '{session_title}' for {session_id}")
+        except Exception as e:
+            logger.warning(f"Failed to persist session title: {e}")
 
     # Memory compression: compress old turns if history exceeds threshold
     from app.services.memory_compressor import maybe_compress

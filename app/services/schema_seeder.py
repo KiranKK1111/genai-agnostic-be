@@ -1,4 +1,4 @@
-"""Schema seeder — embed table/column names and distinct values into FAISS + BM25 + PostgreSQL.
+"""Schema seeder — embed table/column names and distinct values into PostgreSQL.
 
 Architecture:
     1. Collect all corpus text ENRICHED with LLM descriptions + domain synonyms
@@ -6,8 +6,7 @@ Architecture:
     3. Fit the SentenceEncoder on the full enriched corpus
     4. Generate embeddings via the fitted encoder
     5. Batch insert into PostgreSQL (single transaction)
-    6. Build FAISS in-memory indexes (dense/semantic search)
-    7. Build BM25 in-memory indexes (sparse/keyword search)
+    6. Search happens dynamically via PostgreSQL dot product + tsvector (no in-memory indexes)
 
 The enrichment step is critical for semantic understanding:
     Without: "column balance in table accounts, type numeric"
@@ -19,7 +18,6 @@ import json
 from app.services.embedder import embed_texts
 from app.services.sentence_encoder import fit_encoder
 from app.services.faiss_manager import batch_add_to_index, clear_index
-from app.services.bm25_manager import build_bm25_index, clear_bm25_index
 from app.services.schema_inspector import SchemaGraph, DOMAIN_SYNONYMS
 from app.database import get_pool
 from app.config import get_settings
@@ -175,7 +173,9 @@ def _collect_schema_texts(
         # 2. LLM description (e.g., "stores customer profile information")
         # 3. Domain synonyms (e.g., "client, patron, acct_holder")
         # 4. Semantic expansions (e.g., "bank account, financial, deposit")
-        parts = [f"table {tname} {tname_readable}: {col_names}"]
+        # Repeat the exact table name to boost its weight for exact-match queries
+        # This helps distinguish "questionnaire_report" from "questionnaire_report_daily"
+        parts = [f"table {tname} {tname_readable} {tname_readable}: {col_names}"]
         if tmeta.description:
             parts.append(tmeta.description)
         table_syns = reverse_synonyms.get(tname, [])
@@ -196,10 +196,34 @@ def _collect_schema_texts(
             "columns": list(tmeta.columns.keys()),
         })
 
-        # Enrich each column with readable names + semantic expansions
+        # Enrich each column with:
+        # 1. Readable names for query matching
+        # 2. TABLE NAME REPEATED for disambiguation (critical for shared columns)
+        #    "case_id" exists in 5+ tables — repeating the table name 3x boosts
+        #    its TF-IDF weight so "case_id in questionnaire_report" ranks correctly.
+        # 3. Sibling columns as context — makes each table's entry unique
+        #    even when the column name is identical across tables.
+        # 4. Semantic expansions from LLM
+
+        # Pre-compute sibling context per table (other column names)
+        all_col_names = list(tmeta.columns.keys())
+
         for cname, cinfo in tmeta.columns.items():
             cname_readable = cname.replace("_", " ")
-            parts = [f"column {cname} {cname_readable} in table {tname} {tname_readable}, type {cinfo['data_type']}"]
+            # Repeat table name 3x to boost its weight for disambiguation
+            parts = [
+                f"column {cname} {cname_readable} in table {tname} {tname_readable}",
+                f"{tname_readable} {tname_readable}",  # boost table weight
+                f"type {cinfo['data_type']}",
+            ]
+            # Add sibling columns as context (max 8, excluding self)
+            siblings = [c.replace("_", " ") for c in all_col_names if c != cname][:8]
+            if siblings:
+                parts.append(f"alongside {', '.join(siblings)}")
+            # Add table description for further uniqueness
+            if tmeta.description:
+                parts.append(tmeta.description)
+            # Semantic expansions
             col_key = f"{tname}.{cname}"
             col_expansions = expansions.get(col_key, [])
             if col_expansions:
@@ -265,9 +289,8 @@ async def _collect_value_texts(graph: SchemaGraph) -> tuple[list[str], list[dict
 
 
 async def seed_schema_index(schema_texts: list[str], schema_payloads: list[dict]):
-    """Embed schema entries into schema_idx (FAISS + BM25 + PostgreSQL)."""
+    """Embed schema entries into schema_idx (PostgreSQL vectors + tsvector)."""
     await clear_index("schema_idx")
-    clear_bm25_index("schema_idx")
 
     if not schema_texts:
         logger.warning("No schema entries to seed")
@@ -277,18 +300,16 @@ async def seed_schema_index(schema_texts: list[str], schema_payloads: list[dict]
 
     embeddings = await embed_texts(schema_texts, mode="schema")
 
-    metadata_ids = await batch_add_to_index(
+    await batch_add_to_index(
         "schema_idx", embeddings, schema_payloads, contents=schema_texts
     )
 
-    build_bm25_index("schema_idx", schema_texts, metadata_ids)
-    logger.info(f"  schema_idx seeded: {len(schema_texts)} entries (FAISS + BM25)")
+    logger.info(f"  schema_idx seeded: {len(schema_texts)} entries (PostgreSQL)")
 
 
 async def seed_values_index(value_texts: list[str], value_payloads: list[dict]):
-    """Embed distinct values into values_idx (FAISS + BM25 + PostgreSQL)."""
+    """Embed distinct values into values_idx (PostgreSQL vectors + tsvector)."""
     await clear_index("values_idx")
-    clear_bm25_index("values_idx")
 
     if not value_texts:
         logger.info("  values_idx: no indexable values found")
@@ -298,14 +319,13 @@ async def seed_values_index(value_texts: list[str], value_payloads: list[dict]):
 
     embeddings = await embed_texts(value_texts, mode="value")
 
-    metadata_ids = await batch_add_to_index(
+    await batch_add_to_index(
         "values_idx", embeddings, value_payloads, contents=value_texts
     )
 
-    build_bm25_index("values_idx", value_texts, metadata_ids)
     logger.info(
         f"  values_idx seeded: {len(value_texts)} values "
-        f"across {len(set(p['table'] for p in value_payloads))} tables (FAISS + BM25)"
+        f"across {len(set(p['table'] for p in value_payloads))} tables (PostgreSQL)"
     )
 
 

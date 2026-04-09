@@ -434,7 +434,7 @@ End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUE
     session_state["last_follow_up_columns"] = columns
 
     # Title on first message
-    if session_state.get("total_turns", 0) == 0:
+    if session_state.get("_is_first_message", False):
         title = await generate_title(message)
         yield {"type": "session_meta", "session_title": title}
         session_state["title"] = title

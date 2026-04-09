@@ -1,18 +1,12 @@
-"""Hybrid search — Reciprocal Rank Fusion of FAISS dense + BM25 sparse results.
+"""Hybrid search — Reciprocal Rank Fusion of PostgreSQL dense + sparse results.
 
-Implements Stage 19 from Sentence Transformers architecture.
-Dense vectors miss exact keyword matches; BM25 misses semantic similarity.
-Combining both via RRF dominates either alone.
-
-BEIR NDCG@10 benchmark (reference):
-    BM25 only:          43.0
-    Dense only:         49.2
-    Dense + BM25 RRF:   57.8  <- this is what we implement
+Dense:  dot product on normalized real[] vectors (cosine similarity)
+Sparse: tsvector/tsquery full-text search with ts_rank
+Both run as SQL queries — no in-memory indexes.
 """
 import logging
-from typing import Optional
-from app.services.faiss_manager import search_index
-from app.services.bm25_manager import search_bm25
+from app.services.faiss_manager import dense_search, sparse_search
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +17,11 @@ def reciprocal_rank_fusion(
     k: int = 60,
     alpha: float = 0.5,
 ) -> list[tuple[int, float]]:
-    """Combine dense (FAISS) and sparse (BM25) results via RRF.
+    """Combine dense and sparse results via RRF.
 
     Args:
-        dense_results:  [(metadata_id, similarity_score)] from FAISS
-        sparse_results: [(metadata_id, bm25_score)] from BM25
+        dense_results:  [(metadata_id, similarity_score)] from dot product
+        sparse_results: [(metadata_id, ts_rank_score)] from tsvector
         k:     RRF constant (higher = less weight to top ranks). Default 60.
         alpha: weight for dense results (1-alpha for sparse). Default 0.5 (equal).
 
@@ -54,39 +48,25 @@ async def hybrid_search(
     dense_weight: float = None,
     retrieval_k: int = None,
 ) -> list[tuple[int, float]]:
-    """Run FAISS dense + BM25 sparse search, fuse with RRF.
+    """Run PostgreSQL dense + sparse search, fuse with RRF.
 
-    Args:
-        index_name:      which index to search (schema_idx, values_idx, chunks_idx)
-        query_text:      raw query text for BM25
-        query_embedding: query vector for FAISS
-        k:               final number of results to return
-        dense_weight:    alpha for RRF (0.6 = slightly favor dense/semantic)
-        retrieval_k:     how many candidates to pull from each source before fusion
-
-    Returns:
-        [(metadata_id, fused_score)] top-k results.
+    Both searches hit PostgreSQL directly — no in-memory indexes.
     """
-    from app.config import get_settings
     settings = get_settings()
     if dense_weight is None:
         dense_weight = settings.HYBRID_DENSE_WEIGHT
     if retrieval_k is None:
         retrieval_k = settings.HYBRID_RETRIEVAL_K
 
-    # FAISS dense search (semantic similarity)
-    from app.services.faiss_manager import get_faiss_index
-    idx = await get_faiss_index(index_name)
-    dense_results = idx.search(query_embedding, k=retrieval_k)
+    # Dense search (cosine similarity via dot product on real[])
+    dense_results = await dense_search(index_name, query_embedding, k=retrieval_k)
 
-    # BM25 sparse search (keyword matching)
-    sparse_results = search_bm25(index_name, query_text, k=retrieval_k)
+    # Sparse search (keyword matching via tsvector/tsquery)
+    sparse_results = await sparse_search(index_name, query_text, k=retrieval_k)
 
-    # If BM25 index is empty, fall back to dense-only
+    # Fallbacks
     if not sparse_results:
         return dense_results[:k]
-
-    # If FAISS index is empty, fall back to sparse-only
     if not dense_results:
         return sparse_results[:k]
 

@@ -183,31 +183,33 @@ class SentenceEncoder:
         # ── SVD decomposition (Stage 5) ─────────────────────
         k = min(self.dim, vocab_size, self.n_docs)
         try:
-            U, S, Vt = np.linalg.svd(tfidf, full_matrices=False)
+            # Use randomized SVD for large matrices to avoid LAPACK gesdd failures
+            # (gesdd can fail with "init_gesdd failed init" on large matrices)
+            if self.n_docs * vocab_size > 5_000_000:
+                from scipy.sparse.linalg import svds
+                from scipy.sparse import csr_matrix
+                sparse_tfidf = csr_matrix(tfidf)
+                k_svd = min(k, min(sparse_tfidf.shape) - 1)
+                U, S, Vt = svds(sparse_tfidf, k=k_svd)
+                # svds returns smallest singular values first, reverse for largest
+                idx = np.argsort(-S)
+                S = S[idx]
+                Vt = Vt[idx]
+            else:
+                U, S, Vt = np.linalg.svd(tfidf, full_matrices=False)
             self.components = Vt[:k].astype(np.float32)
 
             # ── Dense Projection (Stage 7) ──────────────────
-            # Learn a linear rotation that pushes co-occurring documents
-            # closer together. Uses SVD singular values as importance weights.
-            #
-            # The Dense layer in real ST models (e.g. all-mpnet-base-v2)
-            # is a learned Linear + Tanh that rotates the embedding space.
-            # We approximate this with a weighted rotation derived from
-            # the SVD singular value spectrum.
-            #
-            # W = diag(softmax(S)) — emphasises top semantic dimensions
-            # This is equivalent to a learned importance weighting.
             S_k = S[:k].astype(np.float32)
             # Softmax-normalised importance weights
             s_exp = np.exp(S_k - S_k.max())
             s_weights = s_exp / s_exp.sum()
             # Dense projection: scale each SVD dimension by its importance
-            # then apply a random orthogonal rotation for decorrelation
             self.dense_weight = np.diag(s_weights).astype(np.float32)  # (k, k)
             self.dense_bias = np.zeros(k, dtype=np.float32)
 
-        except np.linalg.LinAlgError:
-            logger.warning("SVD failed — using truncated identity projection")
+        except Exception as e:
+            logger.warning(f"SVD failed ({e}) — using truncated identity projection")
             self.components = np.eye(k, vocab_size, dtype=np.float32)
             self.dense_weight = np.eye(k, dtype=np.float32)
             self.dense_bias = np.zeros(k, dtype=np.float32)
@@ -325,6 +327,47 @@ class SentenceEncoder:
     @property
     def is_fitted(self) -> bool:
         return self._fitted
+
+    # ── Persistence: save/load weights to disk ──────────────────
+
+    def save_weights(self, path: str):
+        """Save all learned weights to a .npz file."""
+        if not self._fitted:
+            raise RuntimeError("Cannot save unfitted encoder")
+        data = {
+            "dim": np.array([self.dim]),
+            "n_docs": np.array([self.n_docs]),
+            "idf": self.idf,
+            "components": self.components,
+        }
+        # vocab stored as JSON string inside the npz
+        import json as _json
+        data["vocab_json"] = np.array([_json.dumps(self.vocab)])
+        if self.dense_weight is not None:
+            data["dense_weight"] = self.dense_weight
+        if self.dense_bias is not None:
+            data["dense_bias"] = self.dense_bias
+        np.savez_compressed(path, **data)
+        logger.info(f"Encoder weights saved to {path}")
+
+    def load_weights(self, path: str):
+        """Load weights from a .npz file. Marks encoder as fitted."""
+        import json as _json
+        data = np.load(path, allow_pickle=False)
+        self.dim = int(data["dim"][0])
+        self.n_docs = int(data["n_docs"][0])
+        self.idf = data["idf"]
+        self.components = data["components"]
+        self.vocab = _json.loads(str(data["vocab_json"][0]))
+        self.dense_weight = data.get("dense_weight")
+        self.dense_bias = data.get("dense_bias")
+        # np.load returns None-like for missing keys; handle gracefully
+        if self.dense_weight is not None and not isinstance(self.dense_weight, np.ndarray):
+            self.dense_weight = None
+        if self.dense_bias is not None and not isinstance(self.dense_bias, np.ndarray):
+            self.dense_bias = None
+        self._fitted = True
+        logger.info(f"Encoder weights loaded from {path} (dim={self.dim}, vocab={len(self.vocab)}, docs={self.n_docs})")
 
 
 # ── Global singleton ────────────────────────────────────────────
