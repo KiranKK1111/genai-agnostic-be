@@ -13,10 +13,41 @@ from app.services.error_registry import get_error
 from app.services.session import SessionManager
 from app.services.audit_logger import log_query
 from app.services.schema_inspector import SchemaGraph
+from app.services.query_logger import (
+    log_query_arrival, log_intent, log_scope_rejected, log_pipeline_done,
+)
 from app.config import get_settings
 from typing import AsyncIterator
 
 logger = logging.getLogger(__name__)
+
+# ── Dynamic viz type resolution ──────────────────────────────────────────────
+def _get_available_viz_types() -> list[str]:
+    """Derive available viz types dynamically from the viz config builder."""
+    from app.builders.viz_config import viz_type_clarification
+    return [o["value"] for o in viz_type_clarification().get("options", [])]
+
+# ── Viz color helpers ─────────────────────────────────────────────────────────
+async def _detect_viz_color_llm(msg: str) -> dict:
+    """Use the LLM to detect chart color preferences — no hardcoded keywords."""
+    from app.services.llm_client import chat_json as _cj
+    try:
+        result = await _cj([{"role": "user", "content":
+            f'Analyze this message for chart color preferences: "{msg}"\n'
+            f'Return JSON: {{"color_mode": "varied" or null, "bar_color": "#hex" or null}}\n'
+            f'- color_mode: set to "varied" when the user wants multiple distinct colors across bars '
+            f'(e.g. "colorful", "variety of colors", "rainbow", "different colors", "multicolor")\n'
+            f'- bar_color: set to a valid CSS hex color code when the user names a single specific color '
+            f'(e.g. "red" → "#ef4444", "green" → "#22c55e", "blue" → "#3b82f6", "purple" → "#8b5cf6")\n'
+            f'- Set both to null if no color preference is expressed\n'
+            f'- color_mode and bar_color are mutually exclusive; prefer color_mode if both apply'}])
+        if result.get("color_mode") == "varied":
+            return {"color_mode": "varied"}
+        if result.get("bar_color"):
+            return {"bar_color": result["bar_color"]}
+    except Exception:
+        pass
+    return {}
 
 # Global schema graph (loaded at startup)
 _schema_graph: SchemaGraph | None = None
@@ -30,13 +61,16 @@ def get_schema_graph() -> SchemaGraph:
 
 
 async def process_message(message: str, session_id: str = None, user_id: str = None,
-                          user_name: str = "User", file_path: str = None,
-                          file_name: str = None) -> AsyncIterator[dict]:
+                          user_name: str = "User", file_id: str = None,
+                          file_name: str = None, file_size: int = None,
+                          file_mime: str = None) -> AsyncIterator[dict]:
     """Main entry point. Processes a user message and yields SSE events."""
     settings = get_settings()
     session_mgr = SessionManager()
     state = await session_mgr.get_or_create(session_id, user_id)
     session_id = state["session_id"]
+
+    log_query_arrival(message, session_id=session_id, user_name=user_name)
 
     yield {"type": "typing_start"}
 
@@ -73,10 +107,11 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
     # ── Step 3: Intent Classification (runs BEFORE scope validation) ─────
     # Intent must be classified first so we know if the user is replying to
     # a clarification (which should bypass scope) or asking something new.
-    has_file = file_path is not None
+    has_file = file_id is not None
     intent_result = await classify_intent(message, state, has_file=has_file)
     intent = intent_result["intent"]
     logger.info(f"Intent: {intent} (confidence={intent_result['confidence']}, method={intent_result['method']})")
+    log_intent(intent, intent_result["confidence"], intent_result["method"], session_id=session_id)
 
     # ── Step 4: Scope Validation ───────────────────────────
     # Skip scope validation for clarification replies — the user is answering our
@@ -85,14 +120,11 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
     if intent != "CLARIFICATION_REPLY":
         scope = validate_scope(message)
         if not scope["in_scope"]:
-            yield {"type": "step", "step_number": 1, "label": "Understanding your question..."}
+            log_scope_rejected(message, session_id=session_id)
+            yield {"type": "step", "step_number": 1, "label": "Understanding your question"}
             from app.services.llm_client import chat
             rejection = await chat([{"role": "user", "content": f"The user asked: \"{message}\"\nPolitely explain that you are designed only for database queries, file analysis, and conversation. You cannot: write code, generate images, browse the web. Keep it brief and friendly (2 sentences). Use an emoji."}])
             yield {"type": "text_done", "content": rejection}
-            yield {"type": "follow_ups", "suggestions": [
-                {"text": "Show me available tables", "type": "chip", "icon": "📊"},
-                {"text": "What can you do?", "type": "question", "icon": "❓"},
-            ]}
             yield {"type": "typing_end"}
             msg_id = await session_mgr.save_message(session_id, "user", message)
             await session_mgr.save_message(session_id, "assistant", rejection, parent_message_id=msg_id)
@@ -100,16 +132,55 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             return
 
     state["last_intent"] = intent
-    state["intent_chain"] = (state.get("intent_chain", []) + [intent])[-10:]
+    state["intent_chain"] = (state.get("intent_chain", []) + [intent])[-settings.INTENT_CHAIN_MAX_LENGTH:]
 
     # Save user message — skip clarification replies (they are transient UI interactions)
     is_clarification_reply = intent == "CLARIFICATION_REPLY"
     is_first_message = state.get("total_turns", 0) == 0  # capture BEFORE incrementing
     if not is_clarification_reply:
-        user_msg_id = await session_mgr.save_message(session_id, "user", message)
+        # If the user uploaded a file with this message, persist the attachment
+        # so the chip + download button can be reconstructed on history reload.
+        user_metadata = {}
+        if file_id and file_name:
+            user_metadata["attachments"] = [file_name]
+            user_metadata["attachment_ids"] = {file_name: file_id}
+            # attachment_meta mirrors the frontend type: { fileName: { size, type } }
+            # so the file-size label on the chip survives page reloads.
+            meta_entry: dict = {}
+            if file_size is not None:
+                meta_entry["size"] = file_size
+            if file_mime:
+                meta_entry["type"] = file_mime
+            if meta_entry:
+                user_metadata["attachment_meta"] = {file_name: meta_entry}
+        user_msg_id = await session_mgr.save_message(
+            session_id, "user", message, metadata=user_metadata
+        )
         await session_mgr.append_history(state, "user", message)
     else:
         user_msg_id = None
+
+    # Rename session to the user's prompt immediately — this is the ONLY place
+    # the session title is set. Pipelines no longer override it with LLM summaries
+    # (those produced misleading titles like "New Message from Unknown User").
+    if is_first_message and not is_clarification_reply:
+        raw = (message or "").strip()
+        # File uploads with an empty / generic auto-message: fall back to the filename
+        if file_name and (not raw or raw.lower().startswith(("analyze this file", "uploaded"))):
+            raw = f"File: {file_name}"
+        prompt_title = raw[:settings.SESSION_TITLE_MAX_LENGTH] or settings.DEFAULT_SESSION_TITLE
+        state["title"] = prompt_title
+        try:
+            from app.database import get_pool as _get_pool
+            _pool = _get_pool()
+            async with _pool.acquire() as _conn:
+                await _conn.execute(
+                    f"UPDATE {settings.APP_SCHEMA}.chat_sessions SET title=$1 WHERE id=$2::uuid",
+                    prompt_title, session_id,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to set initial session title: {e}")
+        yield {"type": "session_meta", "session_title": prompt_title}
 
     # ── Step 5: Pipeline Dispatch ──────────────────────────
     # NOTE: The SSE consumer (chat.py) does event.pop("type") which mutates the dict.
@@ -140,8 +211,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 await log_query(user_id=user_id, session_id=session_id, user_prompt=message,
                                intent=intent, status="ERROR", error=event.get("message"))
 
-    elif intent == "FILE_ANALYSIS" and file_path:
-        async for event in execute_file_upload(file_path, file_name, message, state, user_name):
+    elif intent == "FILE_ANALYSIS" and file_id:
+        async for event in execute_file_upload(file_id, file_name, message, state, user_name):
             etype = event.get("type")
             all_events.append((etype, event))
             yield event
@@ -159,33 +230,24 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
     elif intent == "VIZ_FOLLOW_UP":
         # Reuse cached data
         if state.get("last_data") and state.get("last_columns"):
-            # Use LLM to detect if the user already specified a visualization type
-            from app.services.llm_client import chat_json as _cj_viz
-            from app.builders.viz_config import viz_type_clarification
-            available_options = viz_type_clarification(state["last_columns"]).get("options", [])
-            available_types = [o["value"] for o in available_options]
+            # Read pre-extracted viz details from intent classifier (single LLM pass)
+            viz_detected = state.pop("_viz_detected", {})
+            user_specified = viz_detected.get("types_specified", False)
+            detected_types = viz_detected.get("types", [])
+            color_hints = viz_detected.get("color_hints", {})
 
-            try:
-                extract = await _cj_viz([{"role": "user", "content":
-                    f'The user said: "{message}"\n'
-                    f'Available visualization types: {available_types}\n\n'
-                    f'Did the user specify which visualization type they want?\n'
-                    f'Return JSON: {{"specified": true/false, "types": ["type1"]}}\n'
-                    f'- specified=true if the user clearly named one or more visualization types\n'
-                    f'- specified=false if the user just said something generic like "visualize this" or "show chart"\n'
-                    f'- types: list of matched types from the available list (only if specified=true)'}])
-                user_specified = extract.get("specified", False)
-                detected_types = [t for t in extract.get("types", []) if t in available_types]
-            except Exception:
-                user_specified = False
-                detected_types = []
+            # Build dynamic tool capability string for follow-up questions
+            from app.builders.viz_config import viz_type_clarification as _vtc_orch
+            _viz_opts = _vtc_orch()
+            _viz_labels = ", ".join(o.get("label", o["value"]) for o in _viz_opts.get("options", []))
+            _tool_caps = f"filtering by specific values, drilling down into subsets, sorting, exporting, and visualizing as: {_viz_labels}"
 
             if user_specified and detected_types:
                 # User already specified — skip clarification, render directly
-                detected_viz = detected_types[0]
+                primary_viz = detected_types[0]
                 from app.pipelines.viz_engine import build_viz_config
                 from app.services.llm_client import chat_stream
-                from app.services.response_beautifier import beautify, extract_follow_ups
+                from app.services.response_beautifier import beautify
                 from app.services.sql_executor import execute_sql as _exec_sql
 
                 columns = state["last_columns"]
@@ -193,7 +255,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
 
                 # Re-execute SQL to get full dataset (session only stores 200 rows)
                 if sql:
-                    yield {"type": "step", "step_number": 1, "label": "Loading full dataset..."}
+                    yield {"type": "step", "step_number": 1, "label": "Loading full dataset"}
                     _result = await _exec_sql(sql, uncapped=True)
                     if "error" not in _result and _result.get("rows"):
                         rows = []
@@ -209,14 +271,15 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                     rows = state.get("last_data", [])
                 row_count = len(rows)
 
-                yield {"type": "step", "step_number": 2, "label": "Preparing response..."}
+                yield {"type": "step", "step_number": 2, "label": "Preparing response"}
                 friendly_cols = ', '.join(c.replace('_', ' ').title() for c in columns)
                 response_prompt = (
                     f"The user asked: \"{message}\"\n"
                     f"Found {row_count} records with fields: {friendly_cols}.\n"
-                    f"Write a brief 2-3 sentence summary of the results. Use markdown and mention key numbers.\n"
-                    f"IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details. Use natural business language only.\n"
-                    f"End with FOLLOW_UPS: [\"suggestion\"]"
+                    f"Write 2-3 natural sentences summarizing the results. Use **bold** for key numbers. "
+                    f"Do NOT use pipe-symbol tables or markdown tables — they render as broken symbols. Do NOT enumerate individual rows. Do NOT start with any heading label.\n"
+                    f"IMPORTANT: Do NOT mention database internals (schema names, table names, column names, SQL). Use natural business language only.\n"
+                    f"MANDATORY: End with a follow-up question suggesting ACTIONABLE next steps. The tool supports: {_tool_caps}. Reference specific data from the response. Do NOT ask hypothetical/analytical questions — only suggest things the tool can actually do. Never skip this."
                 )
                 full_text = ""
                 async for token in chat_stream([{"role": "user", "content": response_prompt}]):
@@ -224,13 +287,14 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                     yield {"type": "text_delta", "delta": token}
 
                 full_text = beautify(full_text)
-                follow_ups = extract_follow_ups(full_text, intent="DB_QUERY")
                 if "FOLLOW_UPS:" in full_text:
                     full_text = full_text.split("FOLLOW_UPS:")[0].strip()
                 yield {"type": "text_done", "content": full_text}
 
-                viz_cfg = build_viz_config(detected_viz, columns)
-                viz_cfg["available_views"] = available_types
+                viz_cfg = build_viz_config(primary_viz, columns)
+                # Show all types the user asked for (e.g. ["table", "pie"])
+                viz_cfg["available_views"] = detected_types
+                viz_cfg.update(color_hints)
                 viz_event = {"type": "viz_config", "config": viz_cfg}
                 all_events.append(("viz_config", viz_event))
                 yield viz_event
@@ -239,10 +303,6 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                               "row_count": row_count, "sql": sql, "truncated": False}
                 all_events.append(("data", data_event))
                 yield data_event
-
-                follow_event = {"type": "follow_ups", "suggestions": follow_ups}
-                all_events.append(("follow_ups", follow_event))
-                yield follow_event
             else:
                 # User didn't specify — ask via clarification
                 from app.pipelines.viz_engine import build_viz_clarification
@@ -294,10 +354,21 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 "axis_mode": "on_the_fly",
                 "source_clarification": "database",  # default to DB when skipped
                 "filter_criteria": None,   # no sensible default — user must type criteria
-                "ambiguous_table": None,   # no sensible default — fall through
-                "ambiguous_column": None,
-                "ambiguous_value": None,
             }
+            # For entity/table ambiguity: pick the first option from the pending clarification
+            if clar_type == "ambiguous_entity":
+                options = pending.get("options") or []
+                first_option = options[0].get("value") if options else None
+                if first_option:
+                    defaults["ambiguous_entity"] = first_option
+                    logger.info(f"Skip ambiguous_entity: defaulting to first option '{first_option}'")
+            elif clar_type in ("ambiguous_table", "ambiguous_column", "ambiguous_value"):
+                options = pending.get("options") or []
+                first_option = options[0].get("value") if options else None
+                if first_option:
+                    defaults[clar_type] = first_option
+                    logger.info(f"Skip {clar_type}: defaulting to first option '{first_option}'")
+
             default_val = defaults.get(clar_type)
             if default_val:
                 selected = default_val
@@ -306,7 +377,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 response["selected_values"] = selected
                 state["clarification_response"] = response
             else:
-                # No default available (e.g. ambiguity) — cancel the flow
+                # No default available — cancel the flow
                 state["clarification_pending"] = None
                 state["clarification_response"] = None
                 state["clarification_display"] = None
@@ -324,7 +395,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             # else: custom text reply — falls through to re-run as DB_QUERY with full LLM
         if not selected and clar_type == "viz_type":
             msg_lower = message.strip().lower()
-            if msg_lower in ("table", "bar", "pie", "line"):
+            _avail = set(_get_available_viz_types())
+            if msg_lower in _avail:
                 selected = msg_lower
                 logger.info(f"Viz type clarification: selected='{selected}' from chat message")
             # else: custom text reply — falls through to re-run as DB_QUERY with full LLM
@@ -370,26 +442,55 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 resolved_ambiguities = state.get("resolved_ambiguities", [])
                 resolved_ambiguities.append({"token": token, "resolved": resolved, "type": clar_type})
                 state["resolved_ambiguities"] = resolved_ambiguities
+            elif clar_type == "ambiguous_entity":
+                # User picked which table/report to use for the entity
+                resolved_table = selected if isinstance(selected, str) else (selected[0] if isinstance(selected, list) else str(selected))
+                token = pending.get("token", "")
+                clarified_message = original_message
+                # Store so detector skips re-asking AND planner picks the right table
+                resolved_ambiguities = state.get("resolved_ambiguities", [])
+                resolved_ambiguities.append({
+                    "token": token,
+                    "resolved_table": resolved_table,
+                    "value": resolved_table,
+                    "type": clar_type,
+                })
+                state["resolved_ambiguities"] = resolved_ambiguities
+                # Also set resolved_table so Stage 2a in the planner uses it directly
+                state["resolved_table"] = resolved_table
+                logger.info(
+                    f"Clarification resolved: entity='{token}' → table='{resolved_table}'"
+                )
             else:
                 clarified_message = original_message
 
         elif clar_type == "viz_type":
             # User chose visualization type(s) — render data with summary.
-            # For custom text replies (e.g. "show me a pie chart"), use LLM to extract viz type.
-            known_viz = {"table", "bar", "pie", "line"}
+            # For custom text replies (e.g. "show me a pie chart"), use LLM to extract viz type and color.
+            color_hints: dict = {}
             if isinstance(selected, list):
                 viz_types = selected
-            elif isinstance(selected, str) and all(s.strip() in known_viz for s in selected.split(",")):
+                color_hints = await _detect_viz_color_llm(original_message)
+            elif isinstance(selected, str) and all(s.strip() in set(_get_available_viz_types()) for s in selected.split(",")):
                 viz_types = [s.strip() for s in selected.split(",")]
+                color_hints = await _detect_viz_color_llm(original_message)
             elif selected:
-                # Custom text — ask LLM to extract viz type
+                # Custom text — ask LLM to extract viz type and color preferences
                 from app.services.llm_client import chat_json as _cj2
+                _avail_types = _get_available_viz_types()
                 extract = await _cj2([{"role": "user", "content":
                     f'The user was asked how they want to view data. They replied: "{selected}"\n'
-                    f'Extract the visualization type(s). Options: table, bar, pie, line.\n'
-                    f'Return JSON: {{"types": ["table"]}}'}])
+                    f'Return JSON:\n'
+                    f'{{"types": ["table"], "color_mode": "varied" or null, "bar_color": "#hex" or null}}\n'
+                    f'- types: visualization type(s) chosen from options: {_avail_types}\n'
+                    f'- color_mode: "varied" if the user wants multiple distinct colors across bars; null otherwise\n'
+                    f'- bar_color: a valid CSS hex color code if the user names a single specific color; null otherwise'}])
                 viz_types = extract.get("types", ["table"])
-                viz_types = [v for v in viz_types if v in known_viz] or ["table"]
+                viz_types = [v for v in viz_types if v in set(_avail_types)] or ["table"]
+                if extract.get("color_mode") == "varied":
+                    color_hints = {"color_mode": "varied"}
+                elif extract.get("bar_color"):
+                    color_hints = {"bar_color": extract["bar_color"]}
             else:
                 viz_types = ["table"]
             primary_viz = viz_types[0] if viz_types else "table"
@@ -397,15 +498,19 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             if state.get("last_columns") and (state.get("last_data") or state.get("last_sql")):
                 from app.pipelines.viz_engine import build_viz_config
                 from app.services.llm_client import chat_stream
-                from app.services.response_beautifier import beautify, extract_follow_ups
+                from app.services.response_beautifier import beautify
                 from app.services.sql_executor import execute_sql
+                from app.builders.viz_config import viz_type_clarification as _vtc_clar
+                _viz_opts_clar = _vtc_clar()
+                _viz_labels_clar = ", ".join(o.get("label", o["value"]) for o in _viz_opts_clar.get("options", []))
+                _tool_caps = f"filtering by specific values, drilling down into subsets, sorting, exporting, and visualizing as: {_viz_labels_clar}"
 
                 columns = state["last_columns"]
                 sql = state.get("last_sql", "")
 
                 # Re-execute SQL to get the full dataset (session only stores 200 rows)
                 if sql:
-                    yield {"type": "step", "step_number": 1, "label": "Loading full dataset..."}
+                    yield {"type": "step", "step_number": 1, "label": "Loading full dataset"}
                     result = await execute_sql(sql, uncapped=True)
                     if "error" not in result and result.get("rows"):
                         rows = result["rows"]
@@ -426,14 +531,15 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 row_count = len(rows)
 
                 # Generate summary via LLM
-                yield {"type": "step", "step_number": 2, "label": "Preparing response..."}
+                yield {"type": "step", "step_number": 2, "label": "Preparing response"}
                 friendly_cols = ', '.join(c.replace('_', ' ').title() for c in columns)
                 response_prompt = (
                     f"The user asked: \"{original_message}\"\n"
                     f"Found {row_count} records with fields: {friendly_cols}.\n"
-                    f"Write a brief 2-3 sentence summary of the results. Use markdown and mention key numbers.\n"
-                    f"IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details. Use natural business language only.\n"
-                    f"End with FOLLOW_UPS: [\"suggestion\"]"
+                    f"Write 2-3 natural sentences summarizing the results. Use **bold** for key numbers. "
+                    f"Do NOT use pipe-symbol tables or markdown tables — they render as broken symbols. Do NOT enumerate individual rows. Do NOT start with any heading label.\n"
+                    f"IMPORTANT: Do NOT mention database internals (schema names, table names, column names, SQL). Use natural business language only.\n"
+                    f"MANDATORY: End with a follow-up question suggesting ACTIONABLE next steps. The tool supports: {_tool_caps}. Reference specific data from the response. Do NOT ask hypothetical/analytical questions — only suggest things the tool can actually do. Never skip this."
                 )
                 full_text = ""
                 async for token in chat_stream([{"role": "user", "content": response_prompt}]):
@@ -441,7 +547,6 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                     yield {"type": "text_delta", "delta": token}
 
                 full_text = beautify(full_text)
-                follow_ups = extract_follow_ups(full_text, intent="DB_QUERY")
                 if "FOLLOW_UPS:" in full_text:
                     full_text = full_text.split("FOLLOW_UPS:")[0].strip()
                 yield {"type": "text_done", "content": full_text}
@@ -449,6 +554,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 # Send viz config
                 viz_cfg = build_viz_config(primary_viz, columns)
                 viz_cfg["available_views"] = viz_types
+                viz_cfg.update(color_hints)
                 viz_event = {"type": "viz_config", "config": viz_cfg}
                 all_events.append(("viz_config", viz_event))
                 yield viz_event
@@ -458,10 +564,6 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                               "row_count": row_count, "sql": sql, "truncated": False}
                 all_events.append(("data", data_event))
                 yield data_event
-
-                follow_event = {"type": "follow_ups", "suggestions": follow_ups}
-                all_events.append(("follow_ups", follow_event))
-                yield follow_event
             else:
                 yield {"type": "text_done", "content": "I don't have previous data to visualize. Please run a query first."}
                 full_text = "I don't have previous data to visualize."
@@ -541,11 +643,17 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
             # User chose file or database — route the original message to the right pipeline
             source = selected if isinstance(selected, str) else "database"
             if not source:
-                # Extract from free-text reply
-                msg_lower = message.strip().lower()
-                if any(w in msg_lower for w in ("file", "upload", "document")):
-                    source = "file"
-                else:
+                # Use LLM to detect whether the user means a file or the database
+                from app.services.llm_client import chat_json as _cj_src
+                try:
+                    _src = await _cj_src([{"role": "user", "content":
+                        f'The user said: "{message}"\n'
+                        f'Are they referring to an uploaded file/document or a database table?\n'
+                        f'Return JSON: {{"source": "file" or "database"}}'}])
+                    source = _src.get("source", "database")
+                    if source not in ("file", "database"):
+                        source = "database"
+                except Exception:
                     source = "database"
             if source == "file":
                 async for event in execute_file_followup(original_message, state):
@@ -635,16 +743,13 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
 
     # Save assistant message — persist all rich content so reload can reconstruct the full UI
     # all_events is a list of (event_type, event_dict) tuples.
-    follow_ups = []
     metadata = {}
     content_sql = None
     for etype, ev in all_events:
-        if etype == "follow_ups":
-            follow_ups = ev.get("suggestions", [])
         if etype == "data":
             rows = ev.get("rows", [])
             metadata["data"] = {
-                "rows": rows[:500],  # Cap stored rows to prevent bloated JSONB
+                "rows": rows[:settings.METADATA_ROWS_CAP],  # Cap stored rows to prevent bloated JSONB
                 "columns": ev.get("columns", []),
                 "row_count": ev.get("row_count", len(rows)),
                 "truncated": ev.get("truncated", False),
@@ -684,7 +789,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
     else:
         asst_msg_id = await session_mgr.save_message(
             session_id, "assistant", full_text,
-            metadata=metadata, follow_ups=follow_ups,
+            metadata=metadata, follow_ups=[],
             content_sql=content_sql, parent_message_id=user_msg_id,
             session_snapshot={
                 "last_sql": state.get("last_sql"),
@@ -696,6 +801,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
                 "intent_chain": state.get("intent_chain"),
                 "file_context": state.get("file_context"),
                 "clarification_pending": state.get("clarification_pending"),
+                "history": list(state.get("history", [])),
                 "history_summary": state.get("history_summary"),
                 "total_turns": state.get("total_turns"),
             }
@@ -717,7 +823,7 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
         if etype == "session_meta":
             session_title = ev.get("session_title") or session_title
     logger.info(f"Title check: state_title='{state.get('title')}', resolved='{session_title}', is_first={is_first_message}, events={[(e, ev.get('session_title','')) for e,ev in all_events if e == 'session_meta']}")
-    if session_title and session_title != "New Chat":
+    if session_title and session_title != settings.DEFAULT_SESSION_TITLE:
         try:
             from app.database import get_pool as _get_pool
             pool = _get_pool()
@@ -731,6 +837,32 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
         except Exception as e:
             logger.warning(f"Failed to persist session title: {e}")
 
+    # ── Implicit learning signal ────────────────────────────
+    # Every time the pipeline returns real data (a `data` SSE event), record a
+    # positive training signal: the user's query successfully mapped to a table.
+    # Uses the last entry in sql_history (set by _update_session) to get the
+    # original query text even for CLARIFICATION_REPLY re-runs.
+    has_data_event = any(et == "data" for et, _ in all_events)
+    if has_data_event and asst_msg_id and state.get("last_table"):
+        from app.services.feedback_trainer import record_query_feedback
+        from app.database import get_pool as _fb_pool
+        sql_hist = state.get("sql_history", [])
+        training_query = sql_hist[-1].get("message", message) if sql_hist else message
+        try:
+            await record_query_feedback(
+                pool=_fb_pool(),
+                schema=settings.APP_SCHEMA,
+                session_id=session_id,
+                message_id=asst_msg_id,
+                query_text=training_query,
+                resolved_table=state.get("last_table", ""),
+                resolved_columns=state.get("last_columns", []),
+                plan_json=state.get("last_plan", {}),
+                rating=1,
+            )
+        except Exception as _fb_e:
+            logger.debug(f"Implicit feedback record skipped: {_fb_e}")
+
     # Memory compression: compress old turns if history exceeds threshold
     from app.services.memory_compressor import maybe_compress
     await maybe_compress(state)
@@ -739,6 +871,8 @@ async def process_message(message: str, session_id: str = None, user_id: str = N
         await session_mgr.save(state)
     except Exception as e:
         logger.warning(f"Failed to save session state (client may have disconnected): {e}")
+
+    log_pipeline_done(session_id=session_id, intent=intent)
 
     yield {"type": "typing_end"}
     yield {"type": "done", "message_id": asst_msg_id}

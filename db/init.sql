@@ -10,6 +10,7 @@ CREATE SCHEMA IF NOT EXISTS {app_schema};
 CREATE TABLE IF NOT EXISTS {app_schema}.users (
     id              TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     username        TEXT UNIQUE NOT NULL,
+    name            TEXT,
     email           TEXT UNIQUE,
     hashed_password TEXT NOT NULL,
     role            TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),

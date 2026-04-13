@@ -35,11 +35,16 @@ class Settings(BaseSettings):
     # ── Auth ───────────────────────────────────────────────
     AUTH_ENABLED: bool = False
     JWT_SECRET: str = "local-dev-secret-change-in-production"
-    JWT_EXPIRE_MIN: int = 1440
+    JWT_EXPIRE_MIN: int = 60          # Access token: 1 hour
+    JWT_REFRESH_EXPIRE_MIN: int = 60   # Refresh token: 1 hour — rotated on every refresh call
 
     # ── Session ────────────────────────────────────────────
     SESSION_TTL_HOURS: int = 24
     HISTORY_COMPRESS_THRESHOLD: int = 10   # Compress history when turns exceed this
+    INTENT_CHAIN_MAX_LENGTH: int = 10      # Max intent hops to retain in session state
+    SESSION_TITLE_MAX_LENGTH: int = 60     # Chars to keep from first message as session title
+    METADATA_ROWS_CAP: int = 500           # Max rows persisted in message metadata JSONB
+    DEFAULT_SESSION_TITLE: str = "New Chat"  # Placeholder title before user sends first message
 
     # ── SQL Safety ─────────────────────────────────────────
     SQL_TIMEOUT_SEC: int = 8
@@ -95,6 +100,12 @@ class Settings(BaseSettings):
     NEURAL_TRAIN_LR: float = 0.0003         # Adam learning rate (lower = more stable)
     NEURAL_TRAIN_BATCH_SIZE: int = 16       # Training batch size
     NEURAL_TRAIN_PAIRS: int = 100           # LLM-generated training pairs
+
+    # ── Online Learning from Feedback ─────────────────────────
+    FEEDBACK_MIN_PAIRS: int = 10             # Min new feedback pairs to trigger fine-tuning
+    FEEDBACK_DAYS_BACK: int = 30             # Look-back window for untrained feedback rows
+    FEEDBACK_FINE_TUNE_EPOCHS: int = 10      # Epochs per incremental fine-tune cycle
+    FEEDBACK_FINE_TUNE_LR: float = 0.0001   # Adam LR — low to prevent catastrophic forgetting
 
     # ── Drift Monitoring ───────────────────────────────────
     DRIFT_ALERT_THRESHOLD: float = 0.15      # Similarity distribution shift threshold

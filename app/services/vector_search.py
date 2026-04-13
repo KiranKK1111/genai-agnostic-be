@@ -36,7 +36,7 @@ async def search(index_name: str, query_embedding: list[float], k: int = 5,
     if query_text and not filter_key:
         # Hybrid search: combine dense + sparse via RRF
         fused_results = await hybrid_search(
-            index_name, query_text, query_embedding, k=k * 3 if filter_key else k
+            index_name, query_text, query_embedding, k=k
         )
         if fused_results:
             # Fetch metadata from PostgreSQL for fused results

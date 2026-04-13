@@ -5,6 +5,11 @@ Uses FAISS similarity gap analysis:
     and the top result exceeds MIN_SIMILARITY, the reference is ambiguous.
 
 Returns clarification payloads compatible with the SSE clarification protocol.
+
+New in agentic architecture:
+    detect_entity_ambiguity() — uses EntityResolver to search column-level entries
+    across ALL tables *before* table resolution, so the pipeline asks the right
+    clarifying question immediately rather than guessing the wrong table.
 """
 import logging
 from app.services.embedder import embed_single
@@ -14,6 +19,57 @@ from app.services.schema_inspector import SchemaGraph
 logger = logging.getLogger(__name__)
 
 from app.config import get_settings as _get_settings
+
+
+async def detect_entity_ambiguity(
+    user_message: str,
+    schema_graph: SchemaGraph,
+    resolved_ambiguities: list[dict] | None = None,
+) -> dict | None:
+    """
+    NEW: Pre-table-resolution entity ambiguity check.
+
+    Parses the user message with NLU, extracts entity phrases, then uses
+    EntityResolver to search column-level schema_idx across ALL tables.
+
+    If any entity is found in multiple tables → returns a clarification payload
+    with user-friendly table labels (no raw names exposed).
+
+    This check runs BEFORE the query planner's LLM extraction, so ambiguous
+    queries like "show case status distribution" immediately ask which report
+    to use rather than silently picking the wrong table.
+
+    resolved_ambiguities: list of {token, resolved_table} dicts from prior turns.
+    """
+    from app.services.query_nlu import parse_query
+    from app.services.entity_resolver import resolve_all_entities
+
+    resolved_ambiguities = resolved_ambiguities or []
+    # Build mapping: entity_phrase → already-resolved table
+    resolved_map: dict[str, str] = {}
+    for r in resolved_ambiguities:
+        tok = r.get("token", "").lower().replace("_", " ")
+        table = r.get("resolved_table") or r.get("value", "")
+        if tok and table:
+            resolved_map[tok] = table
+
+    # Parse NLU entities from the message (async LLM-driven)
+    nlu = await parse_query(user_message)
+    if not nlu.entities:
+        return None
+
+    # Resolve all entities via vector search
+    resolutions, first_clarification = await resolve_all_entities(
+        nlu.entities, schema_graph, resolved_tables=resolved_map
+    )
+
+    if first_clarification:
+        logger.info(
+            f"detect_entity_ambiguity | ambiguity found: "
+            f"entity='{first_clarification.get('entity_phrase')}' "
+            f"options={[o['label'] for o in first_clarification.get('options', [])]}"
+        )
+    return first_clarification
 
 
 async def detect_ambiguous_table(token: str, schema_graph: SchemaGraph) -> dict | None:
@@ -196,11 +252,11 @@ async def detect_confusable_tables(plan_tables: list[str],
                 continue
             friendly = tname.replace("_", " ").title()
             desc = tmeta.description if tmeta and tmeta.description else f"{friendly} data"
-            # Detect if this is the "daily" variant
-            is_daily = "daily" in tname or "daily" in (desc or "").lower()
+            # Use the first sentence of description as label, or the friendly name
+            label = desc.split(".")[0].strip() if desc and len(desc.split(".")[0]) < 60 else friendly
             options.append({
                 "value": tname,
-                "label": "Interested" if is_daily else "Not Interested",
+                "label": label,
                 "description": desc,
             })
 
@@ -224,6 +280,7 @@ async def detect_ambiguities(user_message: str, plan_tables: list[str],
     """Run all ambiguity checks. Returns first clarification found, or None.
 
     Check order (most impactful first):
+        0. Entity-level cross-table ambiguity (NLU + vector search — NEW)
         1. Confusable sibling tables (e.g., report vs report_daily)
         2. Ambiguous tables (single token matches 2+ tables)
         3. Ambiguous filter values
@@ -236,6 +293,15 @@ async def detect_ambiguities(user_message: str, plan_tables: list[str],
     resolved_ambiguities = resolved_ambiguities or []
     # Build a set of tokens that were already resolved by previous clarifications
     resolved_tokens = {r.get("token", "").lower() for r in resolved_ambiguities if r.get("token")}
+
+    # ── Check 0: Entity-level cross-table column ambiguity (agentic NLU pass) ──
+    # This runs BEFORE table resolution to catch "case status found in multiple
+    # tables" patterns that the downstream LLM extraction would silently pick one.
+    entity_resolved = any(r.get("type") == "ambiguous_entity" for r in resolved_ambiguities)
+    if not entity_resolved:
+        clar = await detect_entity_ambiguity(user_message, schema_graph, resolved_ambiguities)
+        if clar and clar.get("token", "").lower() not in resolved_tokens:
+            return clar
 
     # Check for confusable sibling tables first (e.g., report vs report_daily)
     # Skip if user already resolved this ambiguity

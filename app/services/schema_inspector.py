@@ -202,48 +202,67 @@ async def inspect_schema() -> SchemaGraph:
                     "table": fk["to_table"], "column": fk["to_column"]
                 }
 
-        # Load sample rows (5 per table)
-        for tname, tmeta in graph.tables.items():
-            try:
-                _, _, _, sample_rows, _ = _get_config_vals()
-                samples = await conn.fetch(f"SELECT * FROM {schema}.{tname} LIMIT {sample_rows}")
-                tmeta.sample_rows = [dict(r) for r in samples]
-            except Exception:
-                pass
+    # Load sample rows (all tables in parallel)
+    _, _, _, sample_rows_limit, _ = _get_config_vals()
 
-        # Build dynamic value index from all low-cardinality columns (text, enum, etc.)
-        # Skip numeric/date types that don't benefit from value indexing
-        _SKIP_TYPES = {"integer", "bigint", "smallint", "numeric", "double precision", "real",
-                       "date", "timestamp without time zone", "timestamp with time zone",
-                       "boolean", "bytea", "uuid", "json", "jsonb"}
-        indexed_values = 0
-        for tname, tmeta in graph.tables.items():
-            for cname, cinfo in tmeta.columns.items():
-                if cinfo["data_type"] in _SKIP_TYPES:
-                    continue
-                try:
-                    count_row = await conn.fetchrow(
-                        f"SELECT COUNT(DISTINCT {cname}) as cnt FROM {schema}.{tname}"
-                    )
-                    distinct_count = count_row["cnt"] if count_row else 0
-                    max_cardinality, _, _, _, _ = _get_config_vals()
-                    if distinct_count == 0 or distinct_count > max_cardinality:
-                        continue
-                    rows = await conn.fetch(
-                        f"SELECT DISTINCT {cname} FROM {schema}.{tname} "
-                        f"WHERE {cname} IS NOT NULL LIMIT {max_cardinality}"
-                    )
-                    for row in rows:
-                        val = row[cname]
-                        if val and isinstance(val, str) and val.strip():
-                            key = val.lower().strip()
-                            if key not in graph.value_index:
-                                graph.value_index[key] = []
-                            graph.value_index[key].append((val, tname, cname))
-                            indexed_values += 1
-                except Exception:
-                    continue
-        logger.info(f"  Value index built: {indexed_values} values, {len(graph.value_index)} unique keys")
+    async def _fetch_samples(tname: str, tmeta: TableMeta) -> None:
+        try:
+            async with pool.acquire() as c:
+                samples = await c.fetch(f"SELECT * FROM {schema}.{tname} LIMIT {sample_rows_limit}")
+                tmeta.sample_rows = [dict(r) for r in samples]
+        except Exception:
+            pass
+
+    await asyncio.gather(*[_fetch_samples(t, m) for t, m in graph.tables.items()])
+
+    # Build dynamic value index from all low-cardinality columns (text, enum, etc.)
+    # Uses a single query per table to get distinct counts, then fetches values in parallel
+    _SKIP_TYPES = {"integer", "bigint", "smallint", "numeric", "double precision", "real",
+                   "date", "timestamp without time zone", "timestamp with time zone",
+                   "boolean", "bytea", "uuid", "json", "jsonb"}
+    max_cardinality, _, _, _, _ = _get_config_vals()
+    indexed_values = 0
+
+    async def _fetch_column_values(tname: str, cname: str) -> list[tuple[str, str, str]]:
+        """Fetch distinct values for a single low-cardinality text column."""
+        try:
+            async with pool.acquire() as c:
+                count_row = await c.fetchrow(
+                    f"SELECT COUNT(DISTINCT {cname}) as cnt FROM {schema}.{tname}"
+                )
+                distinct_count = count_row["cnt"] if count_row else 0
+                if distinct_count == 0 or distinct_count > max_cardinality:
+                    return []
+                rows = await c.fetch(
+                    f"SELECT DISTINCT {cname} FROM {schema}.{tname} "
+                    f"WHERE {cname} IS NOT NULL LIMIT {max_cardinality}"
+                )
+                entries = []
+                for row in rows:
+                    val = row[cname]
+                    if val and isinstance(val, str) and val.strip():
+                        entries.append((val, tname, cname))
+                return entries
+        except Exception:
+            return []
+
+    # Collect all text columns to index
+    col_tasks = []
+    for tname, tmeta in graph.tables.items():
+        for cname, cinfo in tmeta.columns.items():
+            if cinfo["data_type"] not in _SKIP_TYPES:
+                col_tasks.append(_fetch_column_values(tname, cname))
+
+    # Run all column value fetches in parallel
+    results = await asyncio.gather(*col_tasks)
+    for entries in results:
+        for val, tname, cname in entries:
+            key = val.lower().strip()
+            if key not in graph.value_index:
+                graph.value_index[key] = []
+            graph.value_index[key].append((val, tname, cname))
+            indexed_values += 1
+    logger.info(f"  Value index built: {indexed_values} values, {len(graph.value_index)} unique keys")
 
     # Generate LLM descriptions for tables (cached in schema_index table)
     # Uses parallel LLM calls with a semaphore to limit concurrency

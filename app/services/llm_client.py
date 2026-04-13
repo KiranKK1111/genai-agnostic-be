@@ -37,9 +37,10 @@ async def _ensure_llm_available():
             resp.raise_for_status()
         set_llm_available(True)
         logger.info("LLM reconnected — Ollama is now available")
-    except Exception:
+    except Exception as e:
         raise RuntimeError(
-            "LLM is unavailable. Start Ollama with: ollama serve"
+            f"LLM is unavailable ({type(e).__name__}: {e}). "
+            f"Start Ollama with: ollama serve  |  then: ollama pull {settings.AI_FACTORY_MODEL}"
         )
 
 
@@ -59,14 +60,30 @@ async def chat(messages: list[dict], system: str = None, temperature: float = No
     payload["messages"].extend(messages)
 
     async with httpx.AsyncClient(timeout=settings.LLM_REQUEST_TIMEOUT) as client:
-        resp = await client.post(
-            f"{settings.AI_FACTORY_API}/chat/completions",
-            json=payload,
-            headers=_build_headers(),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        try:
+            resp = await client.post(
+                f"{settings.AI_FACTORY_API}/chat/completions",
+                json=payload,
+                headers=_build_headers(),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except httpx.ConnectError:
+            from app.startup_validator import set_llm_available
+            set_llm_available(False)
+            raise RuntimeError(
+                f"Cannot connect to LLM at {settings.AI_FACTORY_API}. "
+                f"Run: ollama serve  |  then: ollama pull {settings.AI_FACTORY_MODEL}"
+            )
+        except httpx.TimeoutException:
+            raise RuntimeError(
+                f"LLM request timed out after {settings.LLM_REQUEST_TIMEOUT}s "
+                f"(model={settings.AI_FACTORY_MODEL}). The model may be under load."
+            )
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:300] if hasattr(e, "response") else ""
+            raise RuntimeError(f"LLM returned HTTP {e.response.status_code}: {body}") from e
 
 
 async def chat_json(messages: list[dict], system: str = None) -> dict:
@@ -103,9 +120,30 @@ async def chat_json(messages: list[dict], system: str = None) -> dict:
             resp.raise_for_status()
             data = resp.json()
             text = data["choices"][0]["message"]["content"]
+        except httpx.ConnectError as e:
+            from app.startup_validator import set_llm_available
+            set_llm_available(False)
+            detail = f"Cannot connect to LLM at {settings.AI_FACTORY_API} — is Ollama running?"
+            logger.error(f"LLM chat_json failed (ConnectError): {detail}", exc_info=True)
+            return {"error": "LLM unreachable", "detail": detail}
+        except httpx.TimeoutException as e:
+            detail = f"LLM request timed out after {settings.LLM_REQUEST_TIMEOUT}s (model={settings.AI_FACTORY_MODEL})"
+            logger.error(f"LLM chat_json failed (Timeout): {detail}")
+            return {"error": "LLM timeout", "detail": detail}
+        except httpx.HTTPStatusError as e:
+            body = e.response.text[:500] if hasattr(e, "response") else ""
+            detail = f"HTTP {e.response.status_code} from LLM: {body}"
+            logger.error(f"LLM chat_json failed (HTTP error): {detail}")
+            return {"error": "LLM HTTP error", "detail": detail}
+        except (KeyError, IndexError) as e:
+            raw = locals().get("data", {})
+            detail = f"Unexpected LLM response shape ({type(e).__name__}: {e}). Response: {str(raw)[:300]}"
+            logger.error(f"LLM chat_json failed (bad response): {detail}")
+            return {"error": "LLM bad response", "detail": detail}
         except Exception as e:
-            logger.error(f"LLM chat_json failed: {e}")
-            return {"error": "LLM request failed", "detail": str(e)}
+            detail = f"{type(e).__name__}: {e}"
+            logger.error(f"LLM chat_json failed: {detail}", exc_info=True)
+            return {"error": "LLM request failed", "detail": detail}
 
     # Strip markdown code fences if present
     text = text.strip()

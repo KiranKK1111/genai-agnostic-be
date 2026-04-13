@@ -136,6 +136,77 @@ class NeuralRefiner:
     def is_trained(self) -> bool:
         return self._trained
 
+    # ── Serialisation helpers ─────────────────────────────────────
+
+    def _to_bytes(self) -> bytes:
+        """Serialise weights to an in-memory .npz byte buffer."""
+        import io
+        buf = io.BytesIO()
+        np.savez_compressed(
+            buf,
+            dim=np.array([self.dim]),
+            l1_W=self.layer1.W, l1_b=self.layer1.b,
+            l2_W=self.layer2.W, l2_b=self.layer2.b,
+        )
+        return buf.getvalue()
+
+    def _from_bytes(self, raw: bytes) -> None:
+        """Deserialise weights from a .npz byte buffer. Marks refiner as trained."""
+        import io
+        data = np.load(io.BytesIO(raw), allow_pickle=False)
+        self.dim = int(data["dim"][0])
+        self.layer1.W = data["l1_W"].astype(np.float32)
+        self.layer1.b = data["l1_b"].astype(np.float32)
+        self.layer2.W = data["l2_W"].astype(np.float32)
+        self.layer2.b = data["l2_b"].astype(np.float32)
+        self._trained = True
+
+    # ── File-based persistence (local dev / fallback) ─────────────
+
+    def save_weights(self, path: str) -> None:
+        """Persist trained weights to a .npz file."""
+        with open(path, "wb") as f:
+            f.write(self._to_bytes())
+        logger.info(f"NeuralRefiner weights saved to {path}")
+
+    def load_weights(self, path: str) -> None:
+        """Load weights from a .npz file. Marks refiner as trained."""
+        with open(path, "rb") as f:
+            self._from_bytes(f.read())
+        logger.info(f"NeuralRefiner weights loaded from {path} (dim={self.dim})")
+
+    # ── PostgreSQL persistence ────────────────────────────────────
+
+    async def save_to_db(self, pool, schema: str) -> None:
+        """Persist weights into {schema}.model_weights (upsert by model_name)."""
+        raw = self._to_bytes()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""INSERT INTO {schema}.model_weights
+                        (model_name, weight_data, schema_hash)
+                    VALUES ('refiner', $1, '')
+                    ON CONFLICT (model_name) DO UPDATE
+                        SET weight_data = EXCLUDED.weight_data,
+                            updated_at  = NOW()""",
+                raw,
+            )
+        logger.info(
+            f"NeuralRefiner weights saved to {schema}.model_weights ({len(raw) // 1024} KB)"
+        )
+
+    async def load_from_db(self, pool, schema: str) -> bool:
+        """Load weights from {schema}.model_weights. Returns True if found."""
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT weight_data FROM {schema}.model_weights "
+                f"WHERE model_name = 'refiner'"
+            )
+        if not row:
+            return False
+        self._from_bytes(bytes(row["weight_data"]))
+        logger.info(f"NeuralRefiner weights loaded from {schema}.model_weights (dim={self.dim})")
+        return True
+
 
 # ═══════════════════════════════════════════════════════════════
 # Stage 9: Multiple Negatives Ranking (MNR) Loss

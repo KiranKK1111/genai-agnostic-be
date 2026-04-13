@@ -1,14 +1,19 @@
 """Database analysis pipeline — query planning, execution, visualization."""
 import json
 import logging
+import time
 from app.services.query_planner import build_query_plan, generate_sql, amend_sql
 from app.services.sql_executor import execute_sql
 from app.services.explain_validator import validate_before_execute
 from app.services.llm_client import chat_stream
-from app.services.response_beautifier import beautify, extract_follow_ups
-from app.services.title_generator import generate_title
+from app.services.response_beautifier import beautify
 from app.services.schema_inspector import SchemaGraph
 from app.services.error_registry import get_error
+from app.services.query_logger import (
+    log_query_plan, log_sql_generated, log_sql_retry,
+    log_execution_result, log_execution_error, log_explain_warning,
+    log_ambiguity, log_followup_base,
+)
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -57,6 +62,7 @@ async def _select_base_query(
         chosen = result.get("query_number", len(sql_history))
         idx = max(0, min(chosen - 1, len(sql_history) - 1))
         logger.info(f"Base query selection: chose Q{idx+1} ({result.get('reason', '')})")
+        log_followup_base(sql_history[idx]["sql"], result.get("reason", ""), idx + 1)
     except Exception as e:
         logger.warning(f"Base query selection failed: {e}, using last query")
         idx = len(sql_history) - 1
@@ -71,27 +77,27 @@ async def execute_db_query(message: str, session_state: dict, schema_graph: Sche
     settings = get_settings()
     schema = settings.POSTGRES_SCHEMA
 
-    yield {"type": "step", "step_number": 1, "label": "Understanding your question..."}
+    yield {"type": "step", "step_number": 1, "label": "Understanding your question"}
 
     if is_follow_up and session_state.get("last_sql"):
         # ── Follow-up: Pick best base query from history, then amend ──
         import re as _re
 
-        # Detect vague/open-ended filter requests — ask for specific criteria
-        # instead of generating a bad SQL query from a vague question
-        vague_filter = _re.search(
-            r"\b(filter|narrow|refine|specific\s+criteria|certain\s+criteria|"
-            r"would you like.*filter|filter.*by.*criteria|"
-            r"based on.*criteria|by.*specific)\b",
-            message, _re.IGNORECASE
-        )
-        # Only treat as vague if the message does NOT contain a concrete value/column
-        # e.g. "filter by country India" is specific, "filter by specific criteria" is vague
-        has_concrete_value = bool(_re.search(
-            r"\b(=|is|equals|above|below|greater|less|more|than|in\s+\w{3,}|where)\b",
-            message, _re.IGNORECASE
-        ))
-        if vague_filter and not has_concrete_value:
+        # Detect vague filter requests using LLM — no hardcoded keywords
+        from app.services.llm_client import chat_json as _cj_vague
+        try:
+            _vague_check = await _cj_vague([{"role": "user", "content":
+                f'The user sent a follow-up message about previously displayed data.\n'
+                f'Message: "{message}"\n\n'
+                f'Is this a VAGUE filter request that does NOT specify concrete criteria '
+                f'(e.g. "filter by criteria", "narrow down", "refine the results")?\n'
+                f'Or does it contain SPECIFIC values/conditions to filter on '
+                f'(e.g. "filter by country India", "only approved ones", "where balance > 5000")?\n\n'
+                f'Return JSON: {{"vague": true/false}}'}])
+            is_vague_filter = _vague_check.get("vague", False)
+        except Exception:
+            is_vague_filter = False
+        if is_vague_filter:
             # Use the SQL that generated the follow-up suggestions the user clicked.
             # This is deterministic — no LLM guessing needed.
             best_sql = session_state.get("last_follow_up_sql") or session_state.get("last_sql", "")
@@ -108,7 +114,7 @@ async def execute_db_query(message: str, session_state: dict, schema_graph: Sche
             }
             return
 
-        yield {"type": "step", "step_number": 2, "label": "Analyzing follow-up context..."}
+        yield {"type": "step", "step_number": 2, "label": "Analyzing follow-up context"}
 
         base_sql = session_state["last_sql"]
         plan_dict = session_state.get("last_plan", {})
@@ -123,11 +129,12 @@ async def execute_db_query(message: str, session_state: dict, schema_graph: Sche
         base_sql = base_sql.strip().rstrip(";") + ";"
         logger.info(f"Follow-up amend: base_sql={base_sql!r}, message={message!r}")
         sql = await amend_sql(base_sql, message, None, schema_graph)
+        log_sql_generated(sql, stage="Follow-up Amended")
         plan_dict = plan_dict
     else:
         # ── New query: Full 8-stage pipeline ───────────────
-        yield {"type": "step", "step_number": 2, "label": "Analyzing database schema..."}
-        yield {"type": "step", "step_number": 3, "label": "Identifying tables and columns..."}
+        yield {"type": "step", "step_number": 2, "label": "Analyzing database schema"}
+        yield {"type": "step", "step_number": 3, "label": "Identifying tables and columns"}
 
         plan = await build_query_plan(message, schema_graph, session_state)
         plan_dict = plan.to_dict()
@@ -160,6 +167,8 @@ Do NOT reveal any internal details like table names, column names, or schema str
         resolved_ambiguities = session_state.get("resolved_ambiguities", [])
         ambiguity = await detect_ambiguities(message, plan.tables, filter_values, schema_graph, resolved_ambiguities)
         if ambiguity:
+            log_ambiguity(ambiguity.get("type", ""), ambiguity.get("token", ""),
+                          [o.get("value", o) for o in ambiguity.get("options", [])])
             yield {"type": "clarification", "clarification": ambiguity}
             session_state["clarification_pending"] = {
                 "type": ambiguity["type"],
@@ -171,11 +180,18 @@ Do NOT reveal any internal details like table names, column names, or schema str
         # Clear resolved ambiguities after successful query (no longer needed)
         session_state["resolved_ambiguities"] = []
 
-        yield {"type": "step", "step_number": 4, "label": "Grounding filter values..."}
+        yield {"type": "step", "step_number": 4, "label": "Grounding filter values"}
         yield {"type": "query_plan", "explanation": f"Tables: {', '.join(plan.tables)}. Filters: {json.dumps(plan.filters, default=str)}"}
-        yield {"type": "step", "step_number": 5, "label": "Generating SQL..."}
+        yield {"type": "step", "step_number": 5, "label": "Generating SQL"}
 
-        sql = await generate_sql(plan, schema, schema_graph)
+        log_query_plan(plan_dict)
+        try:
+            sql = await generate_sql(plan, schema, schema_graph)
+        except RuntimeError as e:
+            logger.error(f"generate_sql failed: {e}")
+            yield {"type": "error", "message": f"SQL generation failed: {e}"}
+            return
+        log_sql_generated(sql, stage="Generated")
 
     logger.info(f"Generated SQL: {sql}")
 
@@ -200,8 +216,10 @@ Do NOT reveal any internal details like table names, column names, or schema str
             explain_failed = True
             explain_error = explain_result.get("warning", "EXPLAIN validation failed")
             logger.warning(f"EXPLAIN validation failed: {explain_error}")
+            log_explain_warning(explain_error, estimated_rows)
         elif explain_result.get("warning"):
             logger.info(f"EXPLAIN warning: {explain_result['warning']}")
+            log_explain_warning(explain_result["warning"], estimated_rows)
     except Exception as e:
         logger.debug(f"EXPLAIN validation skipped: {e}")
 
@@ -226,9 +244,9 @@ Do NOT reveal any internal details like table names, column names, or schema str
         except Exception:
             exact_count = estimated_rows
 
-        # > 5000: ask record_limit (large dataset needs user confirmation)
-        # <= 5000: skip limit question, let post-execution handle viz_type
-        if exact_count > 5000:
+        # Above threshold: ask record_limit (large dataset needs user confirmation)
+        # Below threshold: skip limit question, let post-execution handle viz_type
+        if exact_count > settings.RECORD_WARN_THRESHOLD:
             from app.builders.viz_config import record_limit_clarification
             clar = record_limit_clarification(exact_count, settings.RECORD_WARN_THRESHOLD)
             yield {"type": "clarification", "clarification": clar}
@@ -239,12 +257,22 @@ Do NOT reveal any internal details like table names, column names, or schema str
             return
 
     # ── Stage 8b: Execute (skip if EXPLAIN already caught the error) ───
-    yield {"type": "step", "step_number": 6, "label": "Executing query..."}
+    yield {"type": "step", "step_number": 6, "label": "Executing query"}
 
+    _exec_start = time.monotonic()
     if explain_failed:
         result = {"error": explain_error, "code": "E002"}
     else:
         result = await execute_sql(sql)
+    _exec_ms = (time.monotonic() - _exec_start) * 1000
+
+    if "error" not in result:
+        log_execution_result(
+            len(result.get("rows", [])),
+            result.get("columns", []),
+            _exec_ms,
+            sql=sql,
+        )
 
     # Error retry: send error + actual schema to LLM for correction
     if "error" in result and result.get("code") == "E002":
@@ -276,23 +304,36 @@ Rules:
 - CRITICAL: Only generate SELECT queries
 - CRITICAL: Always prefix table names with schema: {schema}.table_name (e.g. {schema}.customers, {schema}.accounts)
 - CRITICAL: Do NOT include SQL comments (-- or /* */)
+- CRITICAL: ONLY use column names from the ACTUAL table columns above — NEVER invent or guess column names
+- CRITICAL: GROUP BY consistency — every column in SELECT that is not inside an aggregate function (COUNT, SUM, AVG, MIN, MAX) MUST appear in the GROUP BY clause; if you change the GROUP BY column you must also update SELECT accordingly
 - Fix the column/table error using the actual column names above
-- Keep the same intent and filters
+- Keep the same intent and filters as closely as possible
 - Only JOIN tables that have matching FK columns
 - Return ONLY the corrected SQL, no explanation"""
+        log_sql_retry(sql, result["error"])
         try:
             from app.services.query_planner import _extract_sql, _ensure_schema_prefix
             fixed_sql = await llm_chat([{"role": "user", "content": retry_prompt}], temperature=0.1)
             fixed_sql = _extract_sql(fixed_sql)
             fixed_sql = _ensure_schema_prefix(fixed_sql, schema, set(schema_graph.tables.keys()))
             logger.info(f"Retry SQL: {fixed_sql}")
+            log_sql_generated(fixed_sql, stage="Retry Fixed")
+            _retry_start = time.monotonic()
             result = await execute_sql(fixed_sql)
+            _retry_ms = (time.monotonic() - _retry_start) * 1000
             if "error" not in result:
-                sql = fixed_sql  # Use the fixed SQL going forward
+                sql = fixed_sql
+                log_execution_result(
+                    len(result.get("rows", [])),
+                    result.get("columns", []),
+                    _retry_ms,
+                    sql=fixed_sql,
+                )
         except Exception as e:
             logger.error(f"SQL retry failed: {e}")
 
     if "error" in result:
+        log_execution_error(result["error"], sql=sql)
         err = get_error(result.get("code", "E002"), result["error"])
         err["type"] = "error"
         yield err
@@ -309,17 +350,11 @@ Rules:
     if row_count == 0:
         no_data_msg = f"No records were found matching your query. You might want to try different criteria or check if the data exists."
         yield {"type": "text_done", "content": no_data_msg}
-        yield {"type": "follow_ups", "suggestions": [
-            {"text": "Show me available data categories", "type": "chip", "icon": ""},
-            {"text": "Try a broader search", "type": "chip", "icon": ""},
-        ]}
         return
 
     # ── Clarification logic for non-aggregation queries ──────
-    # <= 5000 rows: skip record_limit, ask viz_type directly (new OR follow-up)
-    # > 5000 rows: ask record_limit first (user must confirm large loads)
     if not is_aggregation:
-        if db_total_count > 5000:
+        if db_total_count > settings.RECORD_WARN_THRESHOLD:
             from app.builders.viz_config import record_limit_clarification
             clar = record_limit_clarification(db_total_count, settings.RECORD_WARN_THRESHOLD)
             yield {"type": "clarification", "clarification": clar}
@@ -338,13 +373,23 @@ Rules:
     # Aggregation queries — no clarification needed, just update session
     await _update_session(session_state, sql, plan_dict, rows, columns, schema_graph, message)
     session_state["last_row_count"] = row_count
+    session_state["viz_suggestion_pending"] = False  # reset; will be set below if rows exist
 
     # Generate response text
-    yield {"type": "step", "step_number": 7, "label": "Preparing response..."}
+    yield {"type": "step", "step_number": 7, "label": "Preparing response"}
 
     # Detect yes/no questions for appropriate response style
     import re as _re
     is_yesno = bool(_re.match(r"^(is|are|does|do|can|has|have|was|were|will|should|did)\b", message.strip(), _re.IGNORECASE))
+
+    # Derive available viz types dynamically for the follow-up question
+    from app.builders.viz_config import viz_type_clarification as _vtc
+    _viz_options = _vtc()
+    _viz_labels = ", ".join(o.get("label", o["value"]) for o in _viz_options.get("options", []))
+    _tool_capabilities = (
+        f"filtering data by specific values, drilling down into subsets, sorting, exporting, "
+        f"and visualizing as: {_viz_labels}"
+    )
 
     # Build human-readable field labels from column names (strip underscores, title-case)
     def _friendly_cols(cols):
@@ -365,13 +410,13 @@ Rules:
         response_prompt = f"""The user asked: "{message}"
 Data found: {json.dumps(sanitized, default=str)}
 
-Answer the yes/no question directly in 1-2 sentences based on the actual values returned.
-- Compare the returned value against what the user asked about
-- If it matches, answer "Yes" with the details
-- If it doesn't match, answer "No" and tell them what the actual value is
-Be conversational and concise.
-IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details.
-End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUERIES the user could ask next about THIS data (e.g. "How many are in Bengaluru?", "Show customers with balance above 1 lakh"). Make them specific to the data returned, not generic."""
+Answer the yes/no question directly in 1-2 sentences. Be conversational and concise.
+Do NOT use pipe-symbol tables, markdown tables, or any heading label.
+IMPORTANT: Do NOT mention database internals (schema names, table names, column names, SQL).
+MANDATORY: End with a follow-up question suggesting ACTIONABLE next steps the user can perform in this tool.
+The tool supports: {_tool_capabilities}.
+Reference specific data from the response. Do NOT ask hypothetical/analytical questions — only suggest
+things the tool can actually do. Never skip this."""
     elif is_grouped_aggregation and rows:
         # Grouped aggregation — summarize all groups using friendly labels
         friendly = _friendly_cols(columns)
@@ -379,20 +424,43 @@ End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUE
         for row in rows:
             sanitized_rows.append({friendly[i]: str(v) for i, (k, v) in enumerate(row.items()) if i < len(friendly)})
         all_rows_str = json.dumps(sanitized_rows, default=str)
+        # Identify label and value column names for clear format instructions
+        label_col = friendly[0] if friendly else "group"
+        value_col = friendly[-1] if len(friendly) > 1 else "count"
         response_prompt = f"""The user asked: "{message}"
 Found {row_count} groups:
 {all_rows_str}
 
-Summarize the breakdown in 2-4 sentences. Present each group and its count clearly using **bold** for numbers.
-IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details.
-End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUERIES the user could ask next about THIS data (e.g. "How many are in Bengaluru?", "Show customers with balance above 1 lakh"). Make them specific to the data returned, not generic."""
+Your response MUST have these three parts in order:
+
+1. A brief introductory line that naturally introduces the topic, then 2-3 sentences summarizing the key findings.
+   Use **bold** for the most notable numbers. Mention the dominant group and any interesting patterns.
+
+2. A complete bullet list of ALL groups — each on its own line, formatted as:
+   - **<{label_col}>**: <{value_col}>
+
+3. A follow-up question on its own line that suggests ACTIONABLE next steps the user can perform in this tool.
+   The tool supports: {_tool_capabilities}.
+   Your question MUST suggest actions from these capabilities — referencing specific values or groups from
+   the actual data above. End with a note about available visualization options.
+   This question is MANDATORY — never skip it.
+
+RULES:
+- Do NOT use pipe-symbol tables or markdown tables.
+- Do NOT mention database internals (schema names, table names, column names, SQL). Use natural business language only.
+- Do NOT ask hypothetical/analytical questions like "why are cases being descoped?" or "what steps would you take?"
+  — the tool cannot answer those. Only suggest things the tool can actually do (filter, visualize, drill down, export)."""
     else:
         friendly_col_str = ', '.join(_friendly_cols(columns))
         response_prompt = f"""The user asked: "{message}"
 Found {row_count} records with fields: {friendly_col_str}.{first_row_summary}
-Write a brief 2-3 sentence summary of the results. Use markdown and mention key numbers.
-IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details. Use natural business language only.
-End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUERIES the user could ask next about THIS data (e.g. "How many are in Bengaluru?", "Show customers with balance above 1 lakh"). Make them specific to the data returned, not generic."""
+Write 2-3 natural sentences summarizing the results. Use **bold** for key numbers.
+Do NOT use pipe-symbol tables or markdown tables — they render as broken symbols. Do NOT enumerate individual rows. Do NOT start with any heading label.
+IMPORTANT: Do NOT mention database internals (schema names, table names, column names, SQL). Use natural business language only.
+MANDATORY: End with a follow-up question suggesting ACTIONABLE next steps the user can perform in this tool.
+The tool supports: {_tool_capabilities}.
+Reference specific data from the response. Do NOT ask hypothetical/analytical questions — only suggest
+things the tool can actually do. Never skip this."""
 
     full_text = ""
     async for token in chat_stream([{"role": "user", "content": response_prompt}]):
@@ -406,9 +474,13 @@ End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUE
         yield {"type": "text_delta", "delta": token}
 
     full_text = beautify(full_text)
-    follow_ups = extract_follow_ups(full_text, intent="DB_QUERY")
     if "FOLLOW_UPS:" in full_text:
         full_text = full_text.split("FOLLOW_UPS:")[0].strip()
+
+    # Set viz_suggestion_pending so intent classifier recognises short viz replies
+    # ("yes", "bar chart", "pie please"). The viz option is already part of the
+    # combined question the LLM generates — no separate hardcoded text needed.
+    session_state["viz_suggestion_pending"] = bool(is_aggregation and rows)
 
     yield {"type": "text_done", "content": full_text}
 
@@ -426,18 +498,14 @@ End with FOLLOW_UPS: ["query1", "query2"] — suggest 2 actionable follow-up QUE
 
     yield {"type": "data", "rows": serializable_rows, "columns": columns,
            "row_count": row_count, "sql": sql}
-    yield {"type": "follow_ups", "suggestions": follow_ups}
 
     # Tag the SQL that generated these follow-ups so vague filter requests
     # can find the right base query even after other queries run in between
     session_state["last_follow_up_sql"] = sql
     session_state["last_follow_up_columns"] = columns
 
-    # Title on first message
-    if session_state.get("_is_first_message", False):
-        title = await generate_title(message)
-        yield {"type": "session_meta", "session_title": title}
-        session_state["title"] = title
+    # NOTE: session title is set by the orchestrator from the user's first
+    # prompt — we no longer override it with an LLM summary here.
 
 
 async def execute_db_query_with_sql(sql: str, plan_dict: dict, message: str,
@@ -445,7 +513,7 @@ async def execute_db_query_with_sql(sql: str, plan_dict: dict, message: str,
                                     user_name: str = "User"):
     """Execute a pre-built SQL query, save to session, then ask viz type clarification.
     Used after record_limit clarification — user has confirmed the row count."""
-    yield {"type": "step", "step_number": 1, "label": "Executing query..."}
+    yield {"type": "step", "step_number": 1, "label": "Executing query"}
 
     result = await execute_sql(sql, uncapped=True)
 
@@ -486,6 +554,18 @@ async def _update_session(state, sql, plan, rows, columns, schema_graph, message
         serialized.append(sr)
     state["last_data"] = serialized
     state["last_columns"] = columns
+
+    # Reset viz_suggestion_pending on every successful query execution.
+    # Aggregation pipeline sets it back to True after this if appropriate.
+    # Without this reset, a stale True from a previous aggregation query could
+    # cause the next unrelated message to be misclassified as VIZ_FOLLOW_UP.
+    state["viz_suggestion_pending"] = False
+
+    # Clear NLU aggregation hints from the query planner — they are per-query
+    # and must not bleed into the next query's planning pass.
+    state.pop("_nlu_group_by", None)
+    state.pop("_nlu_aggregation", None)
+
     # Extract primary table
     primary_table = None
     for tname in schema_graph.tables:
@@ -495,7 +575,8 @@ async def _update_session(state, sql, plan, rows, columns, schema_graph, message
                 primary_table = tname
             break
 
-    # Append to sql_history so follow-ups can pick the best base query
+    # Append to sql_history so follow-ups can pick the best base query.
+    # Store intent so _build_session_context can show per-query intent to the LLM.
     import re as _re_hist
     tables_in_sql = [t for t in schema_graph.tables if t in sql.lower()]
     has_join = bool(_re_hist.search(r"\bJOIN\b", sql, _re_hist.IGNORECASE))
@@ -506,6 +587,7 @@ async def _update_session(state, sql, plan, rows, columns, schema_graph, message
         "tables": tables_in_sql,
         "has_join": has_join,
         "columns": columns,
+        "intent": state.get("last_intent", ""),  # capture intent at execution time
     })
     # Keep last 10 queries
     state["sql_history"] = history[-10:]

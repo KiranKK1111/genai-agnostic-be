@@ -29,6 +29,7 @@ class User(BaseModel):
     """Decoded JWT user payload."""
     id: str
     username: str
+    name: Optional[str] = None
     role: str = "user"
 
 
@@ -44,7 +45,7 @@ async def get_current_user(
 
     # Local dev mode — skip auth entirely
     if not settings.AUTH_ENABLED:
-        return User(id="local", username="User", role="admin")
+        return User(id="local", username="User", name="User", role="admin")
 
     # Auth enabled — token required
     if not credentials:
@@ -57,11 +58,22 @@ async def get_current_user(
     token = credentials.credentials
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        # Reject refresh tokens on protected routes — refresh tokens may ONLY
+        # be used against /api/auth/refresh. This prevents an attacker who
+        # steals a refresh token from calling arbitrary APIs with it.
+        if payload.get("type", "access") != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         user_id = payload.get("sub", "")
-        username = payload.get("username", "") or payload.get("name", "") or "User"
+        username = payload.get("username", "") or "User"
+        name = payload.get("name") or username
         return User(
             id=user_id,
             username=username,
+            name=name,
             role=payload.get("role", "user"),
         )
     except jwt.ExpiredSignatureError:

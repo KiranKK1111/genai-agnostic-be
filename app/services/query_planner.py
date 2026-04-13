@@ -3,7 +3,7 @@ import logging
 import json
 import re
 from thefuzz import fuzz
-from app.services.llm_client import chat, chat_json
+from app.services.llm_client import chat, chat_json, is_llm_error
 from app.services.schema_inspector import SchemaGraph, DOMAIN_SYNONYMS
 from app.config import get_settings
 
@@ -126,6 +126,7 @@ class QueryPlan:
 async def _ground_value_full(value: str, plan_tables: list[str], schema_graph: SchemaGraph) -> tuple[str, str | None, str | None]:
     """Full 4-tier value grounding: value_index -> FAISS semantic -> live ILIKE -> fuzzy Levenshtein.
     Returns (grounded_value, table_name, column_name)."""
+    settings = get_settings()
     val_lower = value.lower().strip()
 
     # ── Tier 1: Dynamic value index (built from actual DB values) ──
@@ -353,6 +354,18 @@ async def build_query_plan(user_message: str, schema_graph: SchemaGraph, session
     schema = settings.POSTGRES_SCHEMA
     plan = QueryPlan()
 
+    # ── Stage 0: Semantic NLU pass (fast, no LLM) ─────────
+    # Run before spaCy and LLM so aggregation intent (e.g. "distribution" →
+    # count_group_by) is established authoritatively from surface semantics,
+    # not re-derived (and potentially overridden) by the LLM extraction step.
+    from app.services.query_nlu import parse_query as _parse_nlu
+    nlu_result = await _parse_nlu(user_message)
+    logger.info(
+        f"Stage 0 NLU | entities={nlu_result.entities} "
+        f"agg={nlu_result.aggregation}({nlu_result.aggregation_trigger}) "
+        f"action={nlu_result.action} limit={nlu_result.limit}"
+    )
+
     # ── Stage 1: Entity extraction (spaCy NER + LLM) ──────
     # First pass: spaCy NER + custom patterns (zero LLM cost)
     spacy_entities = _spacy_extract(user_message, schema_graph)
@@ -398,6 +411,19 @@ async def build_query_plan(user_message: str, schema_graph: SchemaGraph, session
 
     tables_info = "\n".join(f"  {t}: {d}" for t, d in table_descriptions.items())
 
+    # Surface NLU context to the LLM so it can use detected aggregation + entities
+    nlu_context = ""
+    if nlu_result.aggregation:
+        nlu_context += (
+            f"\nNLU pre-analysis detected:\n"
+            f"  - Aggregation intent: {nlu_result.aggregation} "
+            f"(triggered by word '{nlu_result.aggregation_trigger}')\n"
+            f"  - Entity candidates: {nlu_result.entities}\n"
+            f"  - Action: {nlu_result.action}\n"
+            f"Use these hints to set 'aggregation' and identify the right table/column.\n"
+            f"For 'count_group_by' aggregation use 'count' in the JSON response.\n"
+        )
+
     extract_prompt = f"""Analyze this database query and extract entities.
 
 Available tables and their descriptions:
@@ -405,7 +431,7 @@ Available tables and their descriptions:
 
 Known synonyms: {json.dumps(synonyms_display)}
 {semantic_hints}
-
+{nlu_context}
 User query: "{user_message}"
 
 Rules:
@@ -453,6 +479,10 @@ Aggregation rules:
 
     llm_entities = await chat_json([{"role": "user", "content": extract_prompt}])
 
+    if is_llm_error(llm_entities):
+        logger.warning(f"Stage 1 LLM entity extraction failed: {llm_entities.get('detail', llm_entities.get('error'))}. Falling back to spaCy-only entities.")
+        llm_entities = {}   # treat as if LLM returned nothing — spaCy results will drive the plan
+
     # Merge: spaCy results take precedence, LLM fills gaps
     entities = {**llm_entities}
     if spacy_entities.get("table_hints"):
@@ -492,11 +522,44 @@ Aggregation rules:
     # Safety override: if the LLM returned "count" but the user clearly wants to
     # retrieve/list data (not count it), correct it. The user must explicitly ask
     # for a count — ambiguous cases default to listing rows.
+    #
+    # EXCEPTION: if NLU detected a semantic aggregation word (e.g. "distribution",
+    # "breakdown", "trend"), trust it — these words unambiguously mean group+count.
     msg_lower = user_message.lower()
     explicitly_counting = any(kw in msg_lower for kw in ["how many", "count of", "number of", "total number", "total count"])
-    if entities.get("aggregation") == "count" and not explicitly_counting:
+    nlu_agg_authoritative = nlu_result.aggregation in (
+        "count_group_by", "count_group_by_time", "count", "sum", "avg", "max", "min"
+    )
+    if entities.get("aggregation") == "count" and not explicitly_counting and not nlu_agg_authoritative:
         logger.info(f"Stage 1: overriding aggregation 'count' → 'none' (no explicit count keywords in message)")
         entities["aggregation"] = "none"
+
+    # Apply NLU-detected aggregation when LLM returned 'none' but NLU found a
+    # semantic aggregation trigger (e.g. "distribution" → count_group_by).
+    if nlu_result.aggregation and entities.get("aggregation", "none") == "none":
+        # Map NLU agg type back to the planner's vocabulary
+        nlu_to_plan = {
+            "count_group_by":      "count",
+            "count_group_by_time": "count",
+            "count":               "count",
+            "sum":                 "sum",
+            "avg":                 "avg",
+            "max":                 "max",
+            "min":                 "min",
+        }
+        mapped = nlu_to_plan.get(nlu_result.aggregation)
+        if mapped:
+            logger.info(
+                f"Stage 1: NLU semantic aggregation '{nlu_result.aggregation}' "
+                f"(trigger='{nlu_result.aggregation_trigger}') → applying '{mapped}'"
+            )
+            entities["aggregation"] = mapped
+
+    # Store count_group_by hint in session state so SQL builder knows to add GROUP BY
+    if nlu_result.aggregation in ("count_group_by", "count_group_by_time"):
+        if session_state is not None:
+            session_state["_nlu_group_by"] = True
+            session_state["_nlu_aggregation"] = nlu_result.aggregation
     if spacy_entities.get("order_by") and not entities.get("order_by"):
         entities["order_by"] = spacy_entities["order_by"]
     if spacy_entities.get("limit") and not entities.get("limit"):
@@ -577,6 +640,13 @@ Aggregation rules:
     logger.info(f"Stage 1 merged entities: {entities}")
 
     # ── Stage 2a: Table resolution ─────────────────────────
+    # If the user resolved an entity ambiguity in a prior turn, honour that choice
+    # by inserting the resolved table at the front before processing LLM hints.
+    forced_table = session_state.get("resolved_table") if session_state else None
+    if forced_table and forced_table in schema_graph.tables:
+        plan.tables.append(forced_table)
+        logger.info(f"Stage 2a: using session-resolved table '{forced_table}' (ambiguous_entity resolved)")
+
     table_hints = entities.get("table_hints", [])
     for hint in table_hints:
         resolved = schema_graph.resolve_table(hint)
@@ -584,9 +654,14 @@ Aggregation rules:
             plan.tables.append(resolved)
 
     # ── Stage 2a-ii: Primary table detection ──────────────
-    # Use the LLM's primary_entity to determine which table the user wants data FROM.
-    # This table goes first in plan.tables so SELECT t1.* returns the right columns.
-    if len(plan.tables) >= 2:
+    # If a table was force-resolved from ambiguity, it always wins first position.
+    # Only use the LLM's primary_entity to reorder when there is no forced table.
+    if forced_table and forced_table in plan.tables:
+        if plan.tables[0] != forced_table:
+            plan.tables.remove(forced_table)
+            plan.tables.insert(0, forced_table)
+        # forced_table is now at position 0; do NOT let LLM primary_entity override it
+    elif len(plan.tables) >= 2:
         primary_hint = entities.get("primary_entity", "")
         if primary_hint:
             primary_table = schema_graph.resolve_table(primary_hint)
@@ -769,6 +844,7 @@ Aggregation rules:
     # ── Stage 5b: Remove unnecessary JOINed tables ─────────
     # After value grounding, check if any non-primary table is actually needed.
     # A JOINed table is unnecessary if no filter references it.
+    # EXCEPTION: the user-resolved (forced) table is always kept regardless of filters.
     if len(plan.tables) >= 2:
         filter_tables = set()
         for f in plan.filters:
@@ -778,7 +854,7 @@ Aggregation rules:
         primary = plan.tables[0]
         needed_tables = [primary]
         for t in plan.tables[1:]:
-            if t in filter_tables:
+            if t in filter_tables or t == forced_table:
                 needed_tables.append(t)
             else:
                 logger.info(f"Stage 5b: removed unnecessary table '{t}' (no filters reference it)")
@@ -797,6 +873,51 @@ Aggregation rules:
     plan.order_by = entities.get("order_by")
     plan.limit = entities.get("limit")
 
+    # ── Stage 6b: GROUP BY column for count_group_by aggregation ──────────
+    # When NLU detects "distribution"/"breakdown"/etc., resolve which column
+    # to group by so generate_sql can produce deterministic GROUP BY SQL.
+    if nlu_result.aggregation in ("count_group_by", "count_group_by_time") and plan.tables:
+        primary_table = plan.tables[0]
+        group_col = None
+
+        # Priority 1: session-state resolved entity → use its column
+        if session_state:
+            for ra in session_state.get("resolved_ambiguities", []):
+                if ra.get("type") == "ambiguous_entity":
+                    res_table = ra.get("resolved_table") or ra.get("value", "")
+                    if res_table == primary_table:
+                        token = ra.get("token", "").replace(" ", "_")
+                        col = schema_graph.resolve_column(primary_table, token)
+                        if col:
+                            group_col = col
+                            break
+
+        # Priority 2: match NLU entity phrases against primary table columns
+        if not group_col:
+            for entity_phrase in nlu_result.entities:
+                col = schema_graph.resolve_column(
+                    primary_table, entity_phrase.replace(" ", "_")
+                )
+                if col:
+                    group_col = col
+                    break
+
+        if group_col:
+            plan.group_by = group_col
+            logger.info(
+                f"Stage 6b: GROUP BY='{group_col}' on table='{primary_table}' "
+                f"(NLU agg={nlu_result.aggregation})"
+            )
+            if session_state is not None:
+                session_state["_nlu_group_by"] = group_col
+                session_state["_nlu_aggregation"] = nlu_result.aggregation
+        else:
+            logger.info(
+                f"Stage 6b: could not resolve GROUP BY column for NLU agg "
+                f"'{nlu_result.aggregation}' on table='{primary_table}' "
+                f"(entities={nlu_result.entities}) — falling back to LLM SQL"
+            )
+
     # ── Stage 7: SQL generation from plan ──────────────────
     # (SQL is generated in db_pipeline using generate_sql)
 
@@ -804,24 +925,67 @@ Aggregation rules:
 
 
 async def generate_sql(plan: QueryPlan, schema: str, schema_graph=None) -> str:
-    """Generate SQL from a structured QueryPlan via LLM."""
-    plan_json = json.dumps(plan.to_dict(), indent=2, default=str)
+    """Generate SQL from a structured QueryPlan via LLM.
 
+    Fast path: when plan.group_by is set with COUNT aggregation on a single table,
+    the SQL is built deterministically (no LLM) for reliability.
+    """
     primary_table = plan.tables[0] if plan.tables else ""
     has_joins = len(plan.tables) > 1
+    group_by_col = plan.group_by  # set by Stage 6b for count_group_by queries
 
-    # Determine SELECT clause — build it deterministically instead of letting LLM guess
     agg = plan.aggregation
+    agg_type = ""
     if agg and agg != "none":
         agg_type = agg if isinstance(agg, str) else agg.get("type", "")
-        if agg_type.upper() == "COUNT":
-            select_clause = f"SELECT COUNT(t1.*)"
-        else:
-            select_clause = None  # Let LLM decide for SUM/AVG/MIN/MAX
-    elif has_joins:
-        select_clause = f"SELECT t1.*"
+
+    # ── Fast path: deterministic GROUP BY COUNT (no LLM needed) ──────────────
+    if agg_type.upper() == "COUNT" and group_by_col and primary_table and not has_joins:
+        alias = "t1"
+        where_parts = []
+        for f in plan.filters:
+            col = f.get("column", "")
+            op = f.get("operator", "=")
+            val = f.get("value", "")
+            if "." in col:
+                col = col.split(".", 1)[1]
+            if isinstance(val, str):
+                where_parts.append(f"{alias}.{col} {op} '{val}'")
+            else:
+                where_parts.append(f"{alias}.{col} {op} {val}")
+        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        sql = (
+            f"SELECT {alias}.{group_by_col}, COUNT(*) AS count"
+            f" FROM {schema}.{primary_table} {alias}"
+            f"{where_clause}"
+            f" GROUP BY {alias}.{group_by_col}"
+            f" ORDER BY count DESC;"
+        )
+        logger.info(f"generate_sql: deterministic count_group_by → {sql}")
+        return sql
+
+    # ── LLM path for complex queries ─────────────────────────────────────────
+    plan_json = json.dumps(plan.to_dict(), indent=2, default=str)
+
+    # Determine SELECT clause deterministically
+    if agg_type.upper() == "COUNT" and group_by_col:
+        # JOIN case with group_by — give LLM a precise instruction
+        alias = "t1"
+        select_clause = f"SELECT {alias}.{group_by_col}, COUNT(*) AS count"
+        group_by_instruction = f"IMPORTANT: Add 'GROUP BY {alias}.{group_by_col} ORDER BY count DESC' at the end."
+    elif agg_type.upper() == "COUNT":
+        select_clause = f"SELECT COUNT(t1.*)"
+        group_by_instruction = ""
     else:
-        select_clause = "SELECT *"
+        select_clause = None  # Let LLM decide for SUM/AVG/MIN/MAX
+        group_by_instruction = ""
+
+    if not agg_type:
+        if has_joins:
+            select_clause = f"SELECT t1.*"
+        else:
+            select_clause = "SELECT *"
+        group_by_instruction = ""
 
     # Include column names + table descriptions for domain-aware SQL generation
     column_hint = ""
@@ -833,12 +997,17 @@ async def generate_sql(plan: QueryPlan, schema: str, schema_graph=None) -> str:
                 desc = f" — {tmeta.description}" if tmeta.description else ""
                 column_hint += f"\n{tname}{desc}\n  columns: {', '.join(cols)}"
 
-    select_instruction = f"IMPORTANT: The SELECT clause MUST be exactly: {select_clause} (where t1 is the alias for '{primary_table}'). Do NOT list individual columns." if select_clause else ""
+    select_instruction = (
+        f"IMPORTANT: The SELECT clause MUST be exactly: {select_clause} "
+        f"(where t1 is the alias for '{primary_table}'). Do NOT list individual columns."
+        if select_clause else ""
+    )
 
     prompt = f"""Generate a PostgreSQL SELECT from this plan. Return ONLY SQL, no explanation.
 Schema: {schema}
 Plan: {plan_json}
 {select_instruction}
+{group_by_instruction}
 
 Table context:{column_hint}
 
@@ -1046,6 +1215,8 @@ ACTUAL values in the database (use ONLY these values in WHERE clauses):
 Rules:
 - CRITICAL: Only generate SELECT queries
 - CRITICAL: Do NOT include SQL comments (-- or /* */)
+- CRITICAL: ONLY use column names that exist in the tables listed above — NEVER invent or guess column names
+- CRITICAL: Every non-aggregated column in SELECT must appear in the GROUP BY clause (GROUP BY consistency)
 - CRITICAL: Only use values from the ACTUAL values list above. Map user terms to the closest matching actual value (e.g. if user says "Visakhapatnam" but actual values have "Vizag", use "Vizag")
 - CRITICAL: PRESERVE all existing WHERE conditions from the original SQL unless the user explicitly asks to remove or change them. The follow-up ADDS to or refines the existing query
 - If the user says "get all", "list all", "show all" etc., change SELECT to return rows (SELECT *) not COUNT(*). Keep the existing filters and JOINs unless the user says to remove them
@@ -1055,7 +1226,11 @@ Rules:
 - If the follow-up references data from a related table, add a JOIN using the appropriate foreign key
 - Return ONLY the amended SQL, no explanation"""
 
-    amended = await chat([{"role": "user", "content": prompt}], temperature=0.1)
+    try:
+        amended = await chat([{"role": "user", "content": prompt}], temperature=0.1)
+    except RuntimeError as e:
+        logger.warning(f"amend_sql LLM call failed ({e}); falling back to original SQL")
+        return original_sql
     amended = _extract_sql(amended)
 
     # Ensure schema prefix survived the LLM amendment

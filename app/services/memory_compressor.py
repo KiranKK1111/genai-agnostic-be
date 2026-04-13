@@ -21,7 +21,14 @@ async def maybe_compress(session_state: dict) -> dict:
 
     try:
         summary = await chat(
-            [{"role": "user", "content": f"Summarize this conversation history in 3-4 sentences. Focus on what data was queried, what tables/filters were used, and key results:\n\n{old_text}"}],
+            [{"role": "user", "content":
+                f"Summarize this conversation history in 3-4 sentences.\n"
+                f"Focus on: what the user asked for, what data was returned (counts, categories, key numbers), "
+                f"any filters applied, and what follow-up actions were taken.\n"
+                f"Write in plain language — do NOT use heading labels, bullet lists, or markdown tables.\n\n"
+                f"{old_text}"}],
+            system="You are a concise conversation summarizer for a data analytics assistant. "
+                   "Produce plain-text summaries that capture user intent and key data findings.",
             temperature=0.2
         )
         session_state["history_summary"] = summary.strip()

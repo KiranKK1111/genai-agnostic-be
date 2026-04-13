@@ -32,6 +32,7 @@ def new_session_state(session_id: str, user_id: str = None) -> dict:
         "clarification_pending": None,
         "clarification_history": [],   # Accumulated Q&A pairs across chained clarifications
         "cancel_requested": False,
+        "viz_suggestion_pending": False,  # True only while awaiting viz reply in active conversation
         "expires_at": expires.isoformat(),
         "total_turns": 0,
     }
@@ -45,6 +46,13 @@ class SessionManager:
         if session_id:
             state = await self.kv.get(f"session:{session_id}")
             if state:
+                # Reset per-request transient flags that must not survive a logout/login cycle.
+                # viz_suggestion_pending: stale True would misclassify the first message after
+                #   re-login as VIZ_FOLLOW_UP (e.g. user types "ok" and it fires a stale viz).
+                # cancel_requested: leftover True from a previous cancellation would block all
+                #   subsequent pipeline runs without any user action.
+                state["viz_suggestion_pending"] = False
+                state["cancel_requested"] = False
                 return state
         # Create new
         sid = session_id or str(uuid.uuid4())
@@ -120,12 +128,32 @@ class SessionManager:
             messages = []
             for r in rows:
                 msg = dict(r)
+                # Parse metadata JSONB once (shared between user + assistant branches)
+                raw_meta = msg.get("metadata") or {}
+                if isinstance(raw_meta, str):
+                    try:
+                        raw_meta = json.loads(raw_meta)
+                    except Exception:
+                        raw_meta = {}
+                msg["metadata"] = raw_meta
+
+                # User messages with file uploads: surface attachments so the
+                # frontend can render download chips on reload.
+                if msg["role"] == "user":
+                    att = raw_meta.get("attachments")
+                    if att:
+                        msg["attachments"] = att
+                    att_ids = raw_meta.get("attachment_ids")
+                    if att_ids:
+                        msg["attachment_ids"] = att_ids
+                    att_meta = raw_meta.get("attachment_meta")
+                    if att_meta:
+                        msg["attachment_meta"] = att_meta
+
                 # Reconstruct a full response object from persisted metadata
                 # so the frontend can render tables, charts, and clarifications on reload
                 if msg["role"] == "assistant":
-                    meta = msg.get("metadata") or {}
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    meta = raw_meta
                     response = {
                         "message": msg["content"],
                         "sql": msg.get("content_sql"),

@@ -108,9 +108,10 @@ def detect_gibberish(text: str) -> dict:
     if any(p in _text_lower for p in ["'; drop", "'; delete", "'; update", "1=1", "or 1=1", "union select"]):
         return {"score": 1.0, "is_gibberish": True, "tier": "reject", "reason": "Suspicious SQL pattern"}
 
-    # Short greetings are always OK
-    if len(text) <= 10 and text.lower() in ["hi", "hello", "hey", "help", "thanks", "bye", "ok", "yes", "no"]:
-        return {"score": 0.0, "is_gibberish": False, "tier": "pass", "reason": "Known greeting"}
+    # Very short messages (≤10 chars, 1-2 words) are never gibberish — they're
+    # greetings, confirmations, or short replies. No hardcoded word list needed.
+    if len(text) <= 10 and len(text.split()) <= 2:
+        return {"score": 0.0, "is_gibberish": False, "tier": "pass", "reason": "Short message"}
 
     # Calculate all 6 signals
     entropy = _char_entropy(text)

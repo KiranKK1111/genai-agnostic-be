@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python3 -c \"print\\(''spacy'' in open\\(''/d/SDM GENAI/GENAI/genai-agnostic-be/requirements.txt''\\).read\\(\\).lower\\(\\)\\)\")",
       "Read(//d/SDM GENAI/GENAI/genai-agnostic-fe/src/**)",
-      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")"
+      "Bash(grep -E \"\\\\.\\(ts|tsx\\)$\")",
+      "Bash(xargs head:*)"
     ],
     "additionalDirectories": [
       "d:\\SDM GENAI\\GENAI\\genai-agnostic-fe\\src\\components"

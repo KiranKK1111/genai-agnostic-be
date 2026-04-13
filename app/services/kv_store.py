@@ -7,7 +7,10 @@ from app.database import get_pool
 logger = logging.getLogger(__name__)
 
 class KVStore:
-    def __init__(self, schema: str = "genai_app"):
+    def __init__(self, schema: str = None):
+        if schema is None:
+            from app.config import get_settings
+            schema = get_settings().APP_SCHEMA
         self.schema = schema
 
     async def get(self, key: str) -> dict | None:

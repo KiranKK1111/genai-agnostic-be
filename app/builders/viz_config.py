@@ -71,6 +71,7 @@ def viz_type_clarification(columns: list = None) -> dict:
             {"value": "table", "label": "Table", "icon": "\U0001f5c2\ufe0f"},
             {"value": "bar", "label": "Bar graph", "icon": "\U0001f4ca"},
             {"value": "pie", "label": "Pie chart", "icon": "\U0001f967"},
+            {"value": "donut", "label": "Donut chart", "icon": "\U0001f369"},
             {"value": "line", "label": "Line graph", "icon": "\U0001f4c8"},
         ]
     }

@@ -11,8 +11,47 @@ from app.services.schema_inspector import inspect_schema
 from app.orchestrator import set_schema_graph
 from app.api import chat, auth, admin, dashboard
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+from rich.logging import RichHandler
+from rich.console import Console
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(
+        console=Console(stderr=False),
+        rich_tracebacks=True,
+        tracebacks_show_locals=False,
+        show_path=False,
+        markup=True,
+    )],
+)
+# Quieten noisy third-party loggers
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("asyncpg").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+async def _ensure_model_weights_table(pool, schema: str) -> None:
+    """Create mstr_app.model_weights if it doesn't exist.
+
+    Stores serialised numpy weights for the SVD encoder and neural refiner
+    so they survive container restarts without a persistent filesystem.
+    """
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {schema}.model_weights (
+                    model_name   VARCHAR(64)  PRIMARY KEY,
+                    weight_data  BYTEA        NOT NULL,
+                    schema_hash  VARCHAR(32)  NOT NULL DEFAULT '',
+                    updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+                )
+            """)
+        logger.info(f"model_weights table ready ({schema}.model_weights)")
+    except Exception as e:
+        logger.warning(f"_ensure_model_weights_table: {e}")
 
 
 @asynccontextmanager
@@ -34,6 +73,7 @@ async def lifespan(app: FastAPI):
     # Run database migrations
     logger.info("Running database migrations...")
     db_dir = os.path.join(os.path.dirname(__file__), "..", "db")
+    import time as _mig_time
 
     # Step 1: Drop legacy HNSW objects (safe, idempotent — runs silently after first cleanup)
     drop_sql_path = os.path.join(db_dir, "drop_hnsw_legacy.sql")
@@ -53,13 +93,23 @@ async def lifespan(app: FastAPI):
         logger.info("  ✓ Database tables created/verified")
 
     # Step 3: Run incremental migrations (safe, idempotent)
-    for migration_file in ["fix_feedback_table.sql", "migrate_pg_search.sql"]:
+    for migration_file in ["fix_feedback_table.sql", "migrate_pg_search.sql",
+                           "add_feedback_training_columns.sql",
+                           "add_ivf_clusters.sql",
+                           "add_uploaded_files.sql",
+                           "add_user_name_column.sql"]:
         mig_path = os.path.join(db_dir, migration_file)
         if os.path.exists(mig_path):
             with open(mig_path, encoding="utf-8") as f:
                 mig_sql = f.read().replace("{app_schema}", settings.APP_SCHEMA)
+            t0 = _mig_time.time()
             async with pool.acquire() as conn:
                 await conn.execute(mig_sql)
+            elapsed = (_mig_time.time() - t0) * 1000
+            if elapsed > 500:
+                logger.warning(f"  ⚠ Migration {migration_file} took {elapsed:.0f}ms")
+            else:
+                logger.info(f"  ✓ {migration_file} ({elapsed:.0f}ms)")
 
     # Schema introspection
     logger.info("Running schema introspection...")
@@ -81,52 +131,88 @@ async def lifespan(app: FastAPI):
     )
     schema_hash = _hl.sha256("|".join(schema_parts).encode()).hexdigest()[:16]
 
-    encoder_path = os.path.join(settings.UPLOAD_DIR, "encoder_weights.npz")
-    hash_path = os.path.join(settings.UPLOAD_DIR, "schema_hash.txt")
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
 
-    # Check if we can skip re-seeding
+    # ── Ensure weight-storage + checksum tables exist ──────────────────────
+    from app.services.rag_indexer import ensure_checksums_table
+    await ensure_checksums_table()
+    await _ensure_model_weights_table(pool, settings.APP_SCHEMA)
+
+    # ── Load encoder weights from DB; skip re-seeding if schema unchanged ──
     needs_reseed = True
-    if os.path.exists(encoder_path) and os.path.exists(hash_path):
-        with open(hash_path) as f:
-            saved_hash = f.read().strip()
-        if saved_hash == schema_hash:
-            # Schema unchanged — load encoder weights and skip seeding
-            try:
-                enc = get_encoder()
-                enc.load_weights(encoder_path)
-                logger.info(f"  ✓ Encoder loaded from cache (schema hash: {schema_hash})")
-                needs_reseed = False
-            except Exception as e:
-                logger.warning(f"  ⚠ Failed to load cached encoder: {e}")
+    enc = get_encoder()
+    try:
+        stored_hash = await enc.load_from_db(pool, settings.APP_SCHEMA)
+        if stored_hash == schema_hash:
+            logger.info(f"  ✓ Encoder loaded from DB (schema hash: {schema_hash})")
+            needs_reseed = False
+        else:
+            logger.info(
+                f"  Schema changed ({stored_hash[:8] if stored_hash else 'none'} → "
+                f"{schema_hash[:8]}) — will re-seed"
+            )
+    except Exception as e:
+        logger.warning(f"  ⚠ Encoder DB load failed: {e} — will re-seed")
+
+    # ── Always try to load the neural refiner from DB ──────────────────────
+    try:
+        from app.services.neural_trainer import NeuralRefiner, set_refiner
+        refiner = NeuralRefiner(dim=settings.EMBEDDING_DIMENSIONS)
+        loaded = await refiner.load_from_db(pool, settings.APP_SCHEMA)
+        if loaded:
+            set_refiner(refiner)
+            logger.info("  ✓ Neural refiner loaded from DB")
+    except Exception as e:
+        logger.warning(f"  ⚠ Neural refiner DB load failed: {e}")
 
     if needs_reseed:
         logger.info("Seeding PostgreSQL vector indexes...")
         try:
             await seed_all(graph)
-            # Save encoder weights for next startup
+            # Persist encoder + neural refiner to DB
             enc = get_encoder()
             if enc.is_fitted:
-                enc.save_weights(encoder_path)
-                with open(hash_path, "w") as f:
-                    f.write(schema_hash)
-            logger.info(f"  ✓ Indexes seeded + encoder cached (schema hash: {schema_hash})")
+                await enc.save_to_db(pool, settings.APP_SCHEMA, schema_hash=schema_hash)
+            from app.services.neural_trainer import get_refiner
+            trained_refiner = get_refiner()
+            if trained_refiner is not None and trained_refiner.is_trained:
+                await trained_refiner.save_to_db(pool, settings.APP_SCHEMA)
+                logger.info("  ✓ Neural refiner saved to DB")
+            logger.info(f"  ✓ Indexes seeded + weights saved to DB (schema hash: {schema_hash})")
         except Exception as e:
             logger.error(f"  ✗ Seeding failed: {e}")
     else:
-        logger.info("  ✓ Skipped re-seeding (schema unchanged, vectors already in PostgreSQL)")
+        logger.info("  ✓ Skipped re-seeding (schema unchanged, weights in DB)")
 
-    # Run embedding evaluation (Stage 27) after seeding/loading
-    from app.services.embedding_eval import evaluate_retrieval
-    try:
-        eval_report = await evaluate_retrieval(graph, k=5)
-        recall = eval_report.get("recall_at_k", 0)
-        if recall < 0.5:
-            logger.warning(f"  ⚠ Embedding quality low: Recall@5={recall:.1%}")
-        else:
-            logger.info(f"  ✓ Embedding eval: Recall@5={recall:.1%}, MRR={eval_report.get('mrr', 0):.3f}")
-    except Exception as e:
-        logger.debug(f"Embedding eval skipped: {e}")
+    # Build PostgreSQL IVF cluster indexes in background (non-blocking)
+    async def _build_ivf_background():
+        try:
+            from app.services.faiss_manager import build_all_ivf_clusters
+            logger.info("Building IVF cluster indexes in PostgreSQL (background)...")
+            ivf_counts = await build_all_ivf_clusters()
+            logger.info(f"  ✓ IVF clusters ready: {ivf_counts}")
+        except Exception as e:
+            logger.warning(f"  ⚠ IVF cluster build failed: {e}")
+
+    # Run background tasks (non-blocking — server starts immediately)
+    import asyncio as _aio
+
+    _aio.create_task(_build_ivf_background())
+
+    # Run embedding evaluation in background (non-blocking)
+    async def _run_eval_background():
+        try:
+            from app.services.embedding_eval import evaluate_retrieval
+            eval_report = await evaluate_retrieval(graph, k=5)
+            recall = eval_report.get("recall_at_k", 0)
+            if recall < 0.5:
+                logger.warning(f"  ⚠ Embedding quality low: Recall@5={recall:.1%}")
+            else:
+                logger.info(f"  ✓ Embedding eval: Recall@5={recall:.1%}, MRR={eval_report.get('mrr', 0):.3f}")
+        except Exception as e:
+            logger.debug(f"Embedding eval skipped: {e}")
+
+    _aio.create_task(_run_eval_background())
 
     # Create upload directory
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)

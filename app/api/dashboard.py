@@ -26,6 +26,23 @@ def _schema() -> str:
     return SCHEMA
 
 
+def _validate_table(table_name: str) -> str:
+    """Sanitize and validate a table name against the known schema graph.
+
+    Raises HTTPException 403 if the table is not in the business schema —
+    prevents authenticated users from querying internal app tables
+    (users, audit_log, feedback, kv_store, etc.) by guessing their names.
+    """
+    safe = "".join(c for c in table_name if c.isalnum() or c == "_")
+    if not safe:
+        raise HTTPException(status_code=400, detail="Invalid table name.")
+    from app.orchestrator import get_schema_graph
+    graph = get_schema_graph()
+    if graph is not None and safe not in graph.tables:
+        raise HTTPException(status_code=403, detail=f"Table '{safe}' is not accessible.")
+    return safe
+
+
 # ── Helpers ────────────────────────────────────────────────
 
 
@@ -151,7 +168,7 @@ async def get_report_summary(
       - Monthly volume (current vs previous month)
     """
     s = _schema()
-    safe_table = "".join(c for c in table_name if c.isalnum() or c == "_")
+    safe_table = _validate_table(table_name)
 
     try:
         # Total count
@@ -233,7 +250,7 @@ async def get_report_charts(
 ):
     """Return chart-ready aggregated data for a business table."""
     s = _schema()
-    safe_table = "".join(c for c in table_name if c.isalnum() or c == "_")
+    safe_table = _validate_table(table_name)
     filter_clause, filter_params = _parse_filters("t", filters)
 
     charts = {}
@@ -323,7 +340,7 @@ async def get_report_data(
 ):
     """Return paginated, filterable table data for a business report."""
     s = _schema()
-    safe_table = "".join(c for c in table_name if c.isalnum() or c == "_")
+    safe_table = _validate_table(table_name)
     filter_clause, filter_params = _parse_filters("t", filters)
 
     try:
@@ -409,7 +426,7 @@ async def get_report_filters(
 ):
     """Return available filter columns and their distinct values for a table."""
     s = _schema()
-    safe_table = "".join(c for c in table_name if c.isalnum() or c == "_")
+    safe_table = _validate_table(table_name)
 
     try:
         cols = await _query(

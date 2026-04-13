@@ -1,27 +1,91 @@
-"""Intent classification — 11-step deterministic + LLM fallback + dual-search probe."""
-import re
+"""Intent classification — unified LLM-driven classification."""
 import logging
 from app.services.llm_client import chat_json
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-GREETING_PATTERNS = re.compile(
-    r"^(hi|hello|hey|good\s+(morning|afternoon|evening)|howdy|greetings|what'?s\s+up|sup)\b",
-    re.IGNORECASE
-)
-VIZ_KEYWORDS = re.compile(
-    r"\b(bar\s*(chart|graph)|pie\s*(chart)?|line\s*(chart|graph)|chart|graph|visuali[sz]e|plot|heatmap|table|show\s+as)\b",
-    re.IGNORECASE
-)
-DB_KEYWORDS = re.compile(
-    r"\b(get|show|list|find|fetch|give|display|retrieve|select|count|how\s+many|total|average|sum|max|min|customers?|clients?|orders?|products?|records?|data|table|rows?)\b",
-    re.IGNORECASE
-)
-COMPARE_KEYWORDS = re.compile(r"\b(compare|vs|versus|both|difference|match|cross)\b", re.IGNORECASE)
+
+# No hardcoded keyword regexes — all classification is LLM-driven.
 
 # Minimum similarity to consider a search hit "strong"
 _SOURCE_PROBE_THRESHOLD = 0.35
+
+
+def _build_session_context(session_state: dict) -> str:
+    """Build a comprehensive, structured session context for LLM intent classification.
+
+    Includes:
+    - Compressed summary of older turns (if memory compressor has run)
+    - Full recent conversation — BOTH user and assistant turns
+    - Every SQL query run this session with tables and columns returned
+    - What is currently on screen (columns, row count)
+    - Previous intent and viz state
+    """
+    parts: list[str] = []
+
+    # 1. Compressed summary of older turns
+    history_summary = (session_state.get("history_summary") or "").strip()
+    if history_summary:
+        parts.append(f"[Older context summary: {history_summary[:500]}]")
+
+    # 2. Full conversation history — user AND assistant turns
+    history = session_state.get("history", [])
+    if history:
+        parts.append("\nFull conversation so far:")
+        for turn in history:
+            role = (turn.get("role") or "").strip()
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+            # Truncate long assistant messages but keep enough for context
+            display = content[:300] + "…" if len(content) > 300 else content
+            label = "User" if role == "user" else "Assistant"
+            parts.append(f"  {label}: \"{display}\"")
+
+    # 3. All SQL queries run this session
+    sql_history = session_state.get("sql_history", [])
+    if sql_history:
+        parts.append("\nDatabase queries this session:")
+        for i, entry in enumerate(sql_history):
+            msg = (entry.get("message") or "").strip()
+            tables = ", ".join(entry.get("tables", []))
+            cols = entry.get("columns", [])
+            col_str = ", ".join(c.replace("_", " ").title() for c in cols[:5])
+            intent_label = entry.get("intent", "")
+            line = f"  Q{i + 1}. \"{msg}\""
+            if intent_label:
+                line += f"  [intent: {intent_label}]"
+            if tables:
+                line += f"  [tables: {tables}]"
+            if col_str:
+                line += f"  [columns returned: {col_str}]"
+            parts.append(line)
+
+    # 4. Current screen state
+    last_cols = session_state.get("last_columns", [])
+    if last_cols:
+        friendly = [c.replace("_", " ").title() for c in last_cols[:6]]
+        row_count = session_state.get("last_row_count", "?")
+        parts.append(f"\nCurrently displayed: {', '.join(friendly)} ({row_count} rows)")
+
+    # 5. Uploaded files
+    file_history = session_state.get("file_history", [])
+    file_ctx = session_state.get("file_context")
+    if file_history:
+        names = [f.get("file_name", "?") for f in file_history]
+        parts.append(f"\nUploaded file(s): {', '.join(names)}")
+    elif file_ctx:
+        parts.append(f"\nUploaded file: {file_ctx.get('file_name', 'unknown')}")
+
+    # 6. Previous intent and viz state
+    prev_intent = session_state.get("last_intent", "")
+    if prev_intent:
+        parts.append(f"\nPrevious intent: {prev_intent}")
+    if session_state.get("viz_suggestion_pending"):
+        parts.append("System just asked the user if they want to visualize the data.")
+
+    return "\n".join(parts)
 
 
 async def _probe_sources(message: str, session_state: dict) -> dict:
@@ -158,135 +222,120 @@ async def classify_intent(message: str, session_state: dict, has_file: bool = Fa
     if has_file:
         return {"intent": "FILE_ANALYSIS", "confidence": 1.0, "method": "file_attached"}
 
-    # Step 3: Greeting (only when no file is attached)
-    if GREETING_PATTERNS.match(message.strip()):
-        return {"intent": "CHAT", "confidence": 1.0, "method": "greeting_regex"}
+    # ── Unified LLM classification — zero hardcoded keywords ─────────────
+    # One LLM call handles ALL intent classification: greetings, viz requests,
+    # follow-ups, new queries, file analysis, hybrid comparisons, chat.
+    # The LLM also extracts viz details (types, colors) in the same pass
+    # so the orchestrator can render directly without a second LLM call.
 
-    # Step 4: Viz keywords + last_data
-    if VIZ_KEYWORDS.search(message) and session_state.get("last_data"):
-        return {"intent": "VIZ_FOLLOW_UP", "confidence": 0.9, "method": "viz_keywords"}
-
-    # Step 5: Follow-up vs new query — use LLM to decide dynamically.
-    # When the user has an active query context (last_sql/last_table), determine if the
-    # new message is a follow-up to that context or an entirely new, independent query.
-    if session_state.get("last_sql"):
-        # Build recent conversation context (last few user messages)
-        history = session_state.get("history", [])
-        recent_user_msgs = []
-        for h in reversed(history):
-            if h.get("role") == "user" and h.get("content"):
-                recent_user_msgs.insert(0, h["content"])
-                if len(recent_user_msgs) >= 3:
-                    break
-
-        conversation_trail = ""
-        if recent_user_msgs:
-            numbered = [f"  {i+1}. \"{m}\"" for i, m in enumerate(recent_user_msgs)]
-            conversation_trail = "Recent conversation (oldest to newest):\n" + "\n".join(numbered)
-
-        # Also tell the LLM about file context so it can detect file follow-ups
-        file_ctx = session_state.get("file_context")
-        file_history = session_state.get("file_history", [])
-        file_hint = ""
-        if file_history:
-            file_names = [f.get("file_name", "?") for f in file_history]
-            file_hint = f"\nThe user has uploaded file(s): {', '.join(file_names)}\n"
-        elif file_ctx:
-            file_hint = f"\nThe user has an uploaded file: {file_ctx.get('file_name', 'unknown')}\n"
-
-        # Include query history so the LLM knows ALL previous queries, not just the last
-        sql_history = session_state.get("sql_history", [])
-        query_history_hint = ""
-        if sql_history:
-            lines = [f"  Q{i+1}. \"{e.get('message', '')}\"" for i, e in enumerate(sql_history[-5:])]
-            query_history_hint = "\nPrevious database queries:\n" + "\n".join(lines) + "\n"
-
-        try:
-            result = await chat_json([{"role": "user", "content":
-                f'The user is interacting with a data query tool.\n'
-                f'{conversation_trail}\n'
-                f'{file_hint}'
-                f'{query_history_hint}\n'
-                f'New message: "{message}"\n\n'
-                f'Determine if this new message is:\n'
-                f'A) A DB_FOLLOW_UP — the user wants to operate on, refine, or explore ANY of the previous '
-                f'database results. The message explicitly or implicitly references data already retrieved '
-                f'(could be the most recent query OR an earlier one).\n\n'
-                f'B) A FILE_FOLLOW_UP — the user wants to ask about or explore the uploaded file. '
-                f'The message references the file content, the file itself, or topics from the file.\n\n'
-                f'C) A NEW_QUERY — the user wants to start fresh and retrieve a completely new dataset '
-                f'that has no relation to any previous query or file.\n\n'
-                f'Think carefully: does the new message relate to ANY previous query context, '
-                f'or is it entirely independent?\n'
-                f'If it refines, narrows, or builds on ANY previous query, it is DB_FOLLOW_UP.\n'
-                f'If it makes sense only as a standalone request with no relation to history, it is NEW_QUERY.\n\n'
-                f'Return JSON: {{"type": "DB_FOLLOW_UP" or "FILE_FOLLOW_UP" or "NEW_QUERY", "reason": "brief explanation"}}'}])
-            detected_type = result.get("type", "NEW_QUERY")
-            logger.info(f"Follow-up check: type={detected_type}, reason={result.get('reason', '')}")
-        except Exception:
-            detected_type = "NEW_QUERY"
-
-        if detected_type == "DB_FOLLOW_UP":
-            return {"intent": "DB_FOLLOW_UP", "confidence": 0.9, "method": "llm_follow_up"}
-        elif detected_type == "FILE_FOLLOW_UP" and file_ctx:
-            return {"intent": "FILE_FOLLOW_UP", "confidence": 0.9, "method": "llm_file_follow_up"}
-        # else: fall through to dual-search probe or new query logic
-
-    # Step 6: Dual-search probe — when user has BOTH file context AND DB,
-    # search both indexes and route based on scores. If both are strong,
-    # return DUAL_SEARCH so the orchestrator can ask a source clarification.
+    session_ctx = _build_session_context(session_state)
     has_file_ctx = bool(session_state.get("file_context")) or bool(session_state.get("file_history"))
+    has_data_on_screen = bool(session_state.get("last_data"))
+    has_prior_query = bool(session_state.get("last_sql"))
+
+    # Derive available viz types dynamically
+    available_viz_types = []
+    if has_data_on_screen:
+        from app.builders.viz_config import viz_type_clarification
+        _available = viz_type_clarification()
+        available_viz_types = [o["value"] for o in _available.get("options", [])]
+
+    # Dual-search probe — provides vector similarity signals for the LLM
+    probe_info = ""
     if has_file_ctx:
         probe = await _probe_sources(message, session_state)
         logger.info(
             f"Dual probe: file_score={probe['file_score']:.3f} ({probe['file_hits']} hits), "
             f"db_score={probe['db_score']:.3f} ({probe['db_hits']} hits)"
         )
+        probe_info = (
+            f"\nVector similarity probe results:\n"
+            f"  File index: score={probe['file_score']:.3f}, hits={probe['file_hits']}\n"
+            f"  DB index: score={probe['db_score']:.3f}, hits={probe['db_hits']}\n"
+        )
 
-        both_strong = probe["file_hits"] > 0 and probe["db_hits"] > 0
-        file_only = probe["file_hits"] > 0 and probe["db_hits"] == 0
-        db_only = probe["db_hits"] > 0 and probe["file_hits"] == 0
+    # Build the unified classification prompt
+    context_flags = []
+    if has_data_on_screen:
+        context_flags.append(f"Data is currently displayed on screen. Available viz types: {available_viz_types}")
+    if has_file_ctx:
+        context_flags.append("User has uploaded file(s) in this session.")
+    if has_prior_query:
+        context_flags.append("User has run previous database queries this session.")
+    context_flags_str = "\n".join(context_flags) if context_flags else "Fresh session — no prior context."
 
-        if both_strong:
-            # Both sources have relevant results — ask user
-            return {"intent": "DUAL_SEARCH", "confidence": 0.85, "method": "dual_probe",
-                    "probe": probe}
-        elif file_only:
-            return {"intent": "FILE_FOLLOW_UP", "confidence": 0.8, "method": "dual_probe_file"}
-        elif db_only:
-            return {"intent": "DB_QUERY", "confidence": 0.8, "method": "dual_probe_db"}
-        # Neither strong — fall through to keyword/LLM
-
-    # Step 6b: File context + no DB keywords (legacy fallback when no dual probe)
-    if has_file_ctx and not DB_KEYWORDS.search(message):
-        return {"intent": "FILE_FOLLOW_UP", "confidence": 0.8, "method": "file_context"}
-
-    # Step 9: File context(s) + compare keywords
-    if has_file_ctx and session_state.get("last_data") and COMPARE_KEYWORDS.search(message):
-        return {"intent": "HYBRID", "confidence": 0.85, "method": "compare_keywords"}
-
-    # Step 10: DB keywords
-    if DB_KEYWORDS.search(message):
-        return {"intent": "DB_QUERY", "confidence": 0.8, "method": "db_keywords"}
-
-    # Step 11: LLM fallback
     try:
-        result = await chat_json([{"role": "user", "content": f"""Classify this message into one of these intents:
-- CHAT (greeting, small talk, capability question)
-- DB_QUERY (asking about data, records, tables)
-- FILE_ANALYSIS (about an uploaded file)
-- DB_FOLLOW_UP (follow-up on previous query)
+        result = await chat_json([{"role": "user", "content":
+            f'You are classifying a user message for a data analytics assistant.\n\n'
+            f'=== SESSION CONTEXT ===\n{session_ctx}\n========================\n\n'
+            f'=== ACTIVE STATE ===\n{context_flags_str}\n{probe_info}====================\n\n'
+            f'User message: "{message}"\n\n'
+            f'Classify as EXACTLY ONE of these intents:\n\n'
+            f'CHAT — greeting, small talk, thanks, goodbye, capability question, or general conversation\n\n'
+            f'DB_QUERY — a self-contained, standalone request to fetch data from the database.\n'
+            f'  Could be the very first message in a fresh session.\n\n'
+            f'DB_FOLLOW_UP — REFINES or BUILDS ON a specific previous database result.\n'
+            f'  Must DEPEND ON prior context (pronouns like "those"/"them", added filters, references to previous values).\n'
+            f'  KEY TEST: Could this be the first message in a brand-new session? If YES → NOT DB_FOLLOW_UP.\n\n'
+            f'VIZ_FOLLOW_UP — wants to visualize, view, display, or change the format of EXISTING on-screen data.\n'
+            f'  KEY SIGNAL: any reference to "this data", "the data", "these results", "the results" combined with a\n'
+            f'  display format (table, chart, graph, pie, bar, line, visualize, view, display, export) = VIZ_FOLLOW_UP.\n'
+            f'  Examples: "get me this data in table", "show this as pie chart", "visualize the results",\n'
+            f'  "I want to view this data", "display as bar graph", "yes", "sure", "ok"\n'
+            f'  Does NOT include requests for NEW/DIFFERENT data even if they mention a chart type\n'
+            f'  (e.g. "show me a bar chart of customers from Mumbai" = DB_QUERY, not VIZ_FOLLOW_UP).\n'
+            f'  Only valid when data is currently on screen.\n\n'
+            f'FILE_ANALYSIS — asks about content of an uploaded file (only when file context exists)\n\n'
+            f'FILE_FOLLOW_UP — follow-up question about an already-analysed file\n\n'
+            f'HYBRID — asks to compare or cross-reference BOTH uploaded file data AND database data\n\n'
+            f'DUAL_SEARCH — the message is ambiguous about whether it refers to file data or database data '
+            f'(only when BOTH file and DB context exist and vector probe shows strong matches in both)\n\n'
+            f'DEFAULT RULES:\n'
+            f'- When in doubt between DB_QUERY and DB_FOLLOW_UP → choose DB_QUERY\n'
+            f'- When in doubt between DB_QUERY and CHAT → choose DB_QUERY\n'
+            f'- VIZ_FOLLOW_UP only when data is on screen AND user wants to change its display format\n\n'
+            f'If intent is VIZ_FOLLOW_UP, also extract:\n'
+            f'- types_specified: true if user named ANY specific format/type from {available_viz_types}\n'
+            f'  ("in table" → types_specified=true, types=["table"]; "as pie chart" → types_specified=true, types=["pie"])\n'
+            f'  false ONLY for completely vague requests like "visualize this" or "I want to see this" with NO type mentioned\n'
+            f'- types: ALL matching types from {available_viz_types} the user mentioned (can be multiple)\n'
+            f'- color_mode: "varied" for multi-color request, null otherwise\n'
+            f'- bar_color: "#hex" for single color request, null otherwise\n\n'
+            f'Return JSON:\n'
+            f'{{"intent": "...", "confidence": 0.0-1.0, "reason": "one line",\n'
+            f'  "types_specified": false, "types": [], "color_mode": null, "bar_color": null}}'}])
 
-Message: "{message}"
-Previous intent: {session_state.get("last_intent", "none")}
-Has file context: {bool(session_state.get("file_context"))}
-Has previous SQL: {bool(session_state.get("last_sql"))}
+        intent = result.get("intent", "CHAT")
+        confidence = result.get("confidence", 0.7)
+        logger.info(f"Unified LLM classification: intent={intent}, confidence={confidence}, reason={result.get('reason', '')}")
 
-Return JSON: {{"intent": "...", "confidence": 0.0-1.0}}"""}])
-        return {
-            "intent": result.get("intent", "CHAT"),
-            "confidence": result.get("confidence", 0.5),
-            "method": "llm_fallback"
-        }
-    except Exception:
-        return {"intent": "CHAT", "confidence": 0.5, "method": "llm_fallback_error"}
+        # Store viz extraction in session so orchestrator doesn't need another LLM call
+        if intent == "VIZ_FOLLOW_UP" and has_data_on_screen:
+            detected_types = [t for t in result.get("types", []) if t in available_viz_types]
+            color_hints = {}
+            if result.get("color_mode") == "varied":
+                color_hints = {"color_mode": "varied"}
+            elif result.get("bar_color"):
+                color_hints = {"bar_color": result["bar_color"]}
+            session_state["_viz_detected"] = {
+                "types_specified": bool(result.get("types_specified") and detected_types),
+                "types": detected_types,
+                "color_hints": color_hints,
+            }
+            session_state["viz_suggestion_pending"] = False
+        elif intent == "VIZ_FOLLOW_UP" and not has_data_on_screen:
+            # No data on screen — can't visualize; reclassify as DB_QUERY
+            intent = "DB_QUERY"
+            confidence = 0.7
+
+        # DUAL_SEARCH validation — only valid when both sources have strong matches
+        if intent == "DUAL_SEARCH" and not has_file_ctx:
+            intent = "DB_QUERY"
+
+        return {"intent": intent, "confidence": confidence, "method": "llm_unified"}
+    except Exception as e:
+        logger.warning(f"Unified LLM classification failed: {e}")
+        # Graceful fallback: if file context and no prior queries, assume file
+        if has_file_ctx and not has_prior_query:
+            return {"intent": "FILE_FOLLOW_UP", "confidence": 0.5, "method": "llm_unified_fallback"}
+        return {"intent": "DB_QUERY" if has_prior_query else "CHAT", "confidence": 0.5, "method": "llm_unified_fallback"}

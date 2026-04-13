@@ -3,7 +3,7 @@ import logging
 from app.services.embedder import embed_single
 from app.services.vector_search import search
 from app.services.llm_client import chat_stream
-from app.services.response_beautifier import beautify, extract_follow_ups
+from app.services.response_beautifier import beautify
 from app.database import get_pool
 from app.config import get_settings
 
@@ -15,7 +15,7 @@ async def execute_hybrid(message: str, session_state: dict):
     settings = get_settings()
     schema = settings.APP_SCHEMA
 
-    yield {"type": "step", "step_number": 1, "label": "Gathering file context..."}
+    yield {"type": "step", "step_number": 1, "label": "Gathering file context"}
 
     # Get relevant file chunks
     query_emb = await embed_single(message)
@@ -33,7 +33,8 @@ async def execute_hybrid(message: str, session_state: dict):
             if row:
                 file_chunks.append(row["chunk_text"])
 
-    yield {"type": "step", "step_number": 2, "label": "Comparing with database results..."}
+    yield {"type": "step", "step_number": 2, "label": "Retrieving database results"}
+    yield {"type": "step", "step_number": 3, "label": "Comparing datasets"}
 
     # Get cached DB data
     db_data = session_state.get("last_data", [])
@@ -50,7 +51,7 @@ async def execute_hybrid(message: str, session_state: dict):
 
     file_summary = f"File content:\n{chr(10).join(file_chunks[:3])}"
 
-    yield {"type": "step", "step_number": 3, "label": "Generating comparison..."}
+    yield {"type": "step", "step_number": 4, "label": "Generating comparison"}
 
     prompt = f"""The user wants to compare file data with database results.
 
@@ -60,8 +61,12 @@ async def execute_hybrid(message: str, session_state: dict):
 
 User question: "{message}"
 
-Provide a clear comparison. Highlight matches, discrepancies, and insights. Use markdown formatting.
-IMPORTANT: Do NOT mention or reveal any database internals such as schema names, table names, column names, SQL queries, or technical implementation details. Use natural business language only."""
+Provide a clear, concise comparison (3-5 sentences). Highlight key matches, discrepancies, and insights. Use **bold** for important numbers or findings.
+Do NOT use pipe-symbol tables (| col | col |) — they render as broken symbols.
+Do NOT start with any heading label like "Summary:" or "Comparison:".
+Do NOT enumerate raw rows or list every record individually.
+IMPORTANT: Do NOT mention database internals (schema names, table names, column names, SQL). Use natural business language only.
+MANDATORY: End with a follow-up question suggesting ACTIONABLE next steps the user can perform in this tool. The tool supports: filtering by specific values, drilling down into subsets, comparing specific categories, exporting, and visualizing as different chart types. Reference specific data from the response. Do NOT ask hypothetical/analytical questions — only suggest things the tool can actually do. Never skip this."""
 
     full_text = ""
     async for token in chat_stream([{"role": "user", "content": prompt}]):
@@ -69,9 +74,7 @@ IMPORTANT: Do NOT mention or reveal any database internals such as schema names,
         yield {"type": "text_delta", "delta": token}
 
     full_text = beautify(full_text)
-    follow_ups = extract_follow_ups(full_text, intent="HYBRID")
     if "FOLLOW_UPS:" in full_text:
         full_text = full_text.split("FOLLOW_UPS:")[0].strip()
 
     yield {"type": "text_done", "content": full_text}
-    yield {"type": "follow_ups", "suggestions": follow_ups}

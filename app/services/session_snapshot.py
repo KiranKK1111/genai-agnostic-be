@@ -16,6 +16,7 @@ SNAPSHOT_FIELDS = [
     "intent_chain",
     "file_context",
     "clarification_pending",
+    "history",
     "history_summary",
     "total_turns",
 ]
@@ -39,5 +40,8 @@ async def restore_snapshot(session_id: str, snapshot: dict):
     for key, value in snapshot.items():
         if key in state:
             state[key] = value
+    # Always reset transient flags — never restore stale in-flight state
+    state["viz_suggestion_pending"] = False
+    state["cancel_requested"] = False
     await sm.save(state)
     logger.info(f"Session {session_id} restored to snapshot")

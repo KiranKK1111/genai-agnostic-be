@@ -3,7 +3,9 @@ import asyncio
 import logging
 from app.services.schema_inspector import inspect_schema
 from app.services.schema_seeder import seed_all
-from app.services.faiss_manager import invalidate_retrieval_cache, cleanup_stale_cache
+from app.services.rag_indexer import get_indexer
+from app.services.faiss_manager import invalidate_retrieval_cache, cleanup_stale_cache, build_all_ivf_clusters
+from app.services.feedback_trainer import fine_tune_from_feedback
 from app.orchestrator import set_schema_graph
 from app.database import get_pool
 from app.config import get_settings
@@ -77,7 +79,34 @@ async def _watch_loop():
             # Invalidate retrieval cache BEFORE rebuilding indexes
             await invalidate_retrieval_cache()
 
-            await seed_all(graph)
+            # Use RAGIndexer for incremental re-indexing (skips unchanged content)
+            indexer = get_indexer()
+            stats_list = await indexer.reindex_all(graph, force=False)
+            for s in stats_list:
+                logger.info(f"Schema watcher re-index: {s}")
+
+            # Rebuild IVF cluster indexes to pick up newly added/changed vectors
+            await build_all_ivf_clusters()
+
+            # ── Incremental online learning from feedback ─────────────────
+            # Fine-tune the NeuralRefiner on any feedback that has accumulated
+            # since the last training run (trained_on=false rows only).
+            # Runs silently if there are fewer than FEEDBACK_MIN_PAIRS new pairs.
+            try:
+                from app.services.sentence_encoder import get_encoder as _get_enc
+                _pool = get_pool()
+                trained, n_fb = await fine_tune_from_feedback(
+                    pool=_pool,
+                    schema=settings.APP_SCHEMA,
+                    graph=graph,
+                    encoder=_get_enc(),
+                )
+                if trained:
+                    logger.info(
+                        f"Schema watcher: neural refiner fine-tuned on {n_fb} feedback pairs"
+                    )
+            except Exception as e:
+                logger.debug(f"Feedback fine-tuning skipped: {e}")
 
             # Run drift check (Stage 30) after re-seeding
             from app.services.drift_monitor import run_full_drift_check

@@ -1,11 +1,89 @@
-"""Multi-format file content extraction."""
+"""Multi-format file content extraction — path-based and bytes-based."""
+import asyncio
 import os
 import csv
 import json
 import logging
-from io import StringIO
+from io import StringIO, BytesIO
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_file_bytes_sync(content: bytes, file_name: str) -> str:
+    """Synchronous file parsing. Called from a thread executor by parse_file_bytes."""
+    ext = os.path.splitext(file_name)[1].lower()
+    try:
+        if ext == ".txt":
+            return content.decode("utf-8", errors="replace")
+
+        elif ext == ".csv":
+            text = content.decode("utf-8", errors="replace")
+            reader = csv.DictReader(StringIO(text))
+            rows = [", ".join(f"{k}: {v}" for k, v in row.items()) for row in reader]
+            return "\n".join(rows)
+
+        elif ext == ".json":
+            data = json.loads(content.decode("utf-8"))
+            return json.dumps(data, indent=2, default=str)
+
+        elif ext == ".pdf":
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(BytesIO(content))
+                return "".join(page.extract_text() or "" for page in reader.pages)
+            except ImportError:
+                return "[PDF parsing requires PyPDF2. Install: pip install PyPDF2]"
+
+        elif ext == ".docx":
+            try:
+                from docx import Document
+                doc = Document(BytesIO(content))
+                parts = [p.text for p in doc.paragraphs if p.text.strip()]
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_text = " | ".join(c.text.strip() for c in row.cells)
+                        if row_text.strip():
+                            parts.append(row_text)
+                return "\n".join(parts)
+            except ImportError:
+                return "[DOCX parsing requires python-docx. Install: pip install python-docx]"
+
+        elif ext in (".xlsx", ".xls"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(BytesIO(content), read_only=True)
+                text_parts = []
+                for sheet in wb.sheetnames:
+                    ws = wb[sheet]
+                    headers: list[str] = []
+                    for i, row in enumerate(ws.iter_rows(values_only=True)):
+                        if i == 0:
+                            headers = [str(c or "") for c in row]
+                        else:
+                            text_parts.append(", ".join(
+                                f"{headers[j] if j < len(headers) else f'col{j}'}: {str(c or '')}"
+                                for j, c in enumerate(row)
+                            ))
+                return "\n".join(text_parts)
+            except ImportError:
+                return "[XLSX parsing requires openpyxl. Install: pip install openpyxl]"
+
+        else:
+            return f"[Unsupported file type: {ext}]"
+
+    except Exception as e:
+        logger.error(f"parse_file_bytes error ({file_name}): {e}")
+        return f"[Error parsing file: {e}]"
+
+
+async def parse_file_bytes(content: bytes, file_name: str) -> str:
+    """Extract text directly from raw bytes. No filesystem access needed.
+
+    Offloads the heavy sync work (PyPDF2/openpyxl/python-docx) to a thread
+    executor so it doesn't block the asyncio event loop while a file is being
+    parsed. Without this, large PDFs/Excels will freeze the entire server.
+    """
+    return await asyncio.to_thread(_parse_file_bytes_sync, content, file_name)
 
 
 async def parse_file(file_path: str) -> str:

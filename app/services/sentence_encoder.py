@@ -38,27 +38,42 @@ logger = logging.getLogger(__name__)
 # "customers" → ["customers", "#cus", "#ust", "#sto", "#tom", "#ome", "#mer", "#ers"]
 
 def _tokenize(text: str) -> list[str]:
-    """Subword-like tokenization: word unigrams + sub-words + character trigrams.
+    """Subword-like tokenization: word unigrams + bigrams + sub-words + char trigrams.
 
     Compound tokens containing underscores (e.g. 'erp_customers') are split
     into parts ('erp', 'customers') IN ADDITION to keeping the original.
     This ensures queries ("erp customers") share word tokens with corpus
     entries ("erp_customers") — without this, overlap is zero.
+
+    Word bigrams capture phrases: "case status" → token "case_status" which
+    matches the schema column of the same name directly.
     """
     text = text.lower().strip()
     words = re.findall(r"[a-z0-9_]+", text)
-    tokens = []
+
+    # Flatten compound words so we work with atomic word parts for bigrams
+    flat_words: list[str] = []
     for word in words:
-        tokens.append(word)
-        # Split compound tokens on underscores so both parts become searchable
+        flat_words.append(word)
         if "_" in word:
-            parts = [p for p in word.split("_") if p]
-            if len(parts) > 1:
-                tokens.extend(parts)
-        # Character trigrams for morphological similarity
-        if len(word) >= 3:
+            flat_words.extend(p for p in word.split("_") if p)
+
+    tokens: list[str] = list(flat_words)
+
+    # Word bigrams: "case" + "status" → "case_status"
+    # This makes phrase matching robust even before SVD compression
+    for i in range(len(flat_words) - 1):
+        a, b = flat_words[i], flat_words[i + 1]
+        # Only bigram atomic words (no compound tokens), cap length to avoid noise
+        if "_" not in a and "_" not in b and len(a) + len(b) <= 24:
+            tokens.append(f"{a}_{b}")
+
+    # Character trigrams for morphological similarity
+    for word in flat_words:
+        if "_" not in word and len(word) >= 3:
             for i in range(len(word) - 2):
                 tokens.append(f"#{word[i:i+3]}")
+
     return tokens
 
 
@@ -157,7 +172,13 @@ class SentenceEncoder:
             f"{vocab_size} tokens in vocabulary"
         )
 
-        # ── Compute IDF ─────────────────────────────────────
+        # ── BM25 parameters (from config) ───────────────────
+        from app.config import get_settings as _gs
+        _s = _gs()
+        bm25_k1: float = getattr(_s, "BM25_K1", 1.5)
+        bm25_b:  float = getattr(_s, "BM25_B",  0.75)
+
+        # ── Compute IDF (BM25-style) ─────────────────────────
         df = np.zeros(vocab_size, dtype=np.float64)
         for tokens in doc_tokens:
             seen: set[str] = set()
@@ -165,16 +186,29 @@ class SentenceEncoder:
                 if t in self.vocab and t not in seen:
                     df[self.vocab[t]] += 1
                     seen.add(t)
-        self.idf = np.log((self.n_docs + 1) / (df + 1)) + 1.0
+        # Robertson-Spärck Jones IDF: log((N - df + 0.5) / (df + 0.5) + 1)
+        self.idf = np.log(
+            (self.n_docs - df + 0.5) / (df + 0.5) + 1.0
+        ).astype(np.float64)
 
-        # ── Build TF-IDF matrix (Stage 4) ───────────────────
+        # ── Average document length (for BM25 length normalisation) ──
+        doc_lengths = np.array([len(t) for t in doc_tokens], dtype=np.float64)
+        self._avgdl = float(doc_lengths.mean()) if len(doc_lengths) else 1.0
+
+        # ── Build BM25 matrix (Stage 4) ─────────────────────
+        # BM25 TF: (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+        # This caps term saturation and normalises for document length,
+        # outperforming log-TF on long schema documents with many column names.
         tfidf = np.zeros((self.n_docs, vocab_size), dtype=np.float64)
         for i, tokens in enumerate(doc_tokens):
             tf = Counter(tokens)
+            dl = len(tokens)
+            norm_factor = 1.0 - bm25_b + bm25_b * dl / self._avgdl
             for token, count in tf.items():
                 if token in self.vocab:
                     j = self.vocab[token]
-                    tfidf[i, j] = (1.0 + math.log(max(count, 1))) * self.idf[j]
+                    tf_bm25 = (count * (bm25_k1 + 1.0)) / (count + bm25_k1 * norm_factor)
+                    tfidf[i, j] = tf_bm25 * self.idf[j]
 
         row_norms = np.linalg.norm(tfidf, axis=1, keepdims=True)
         row_norms = np.clip(row_norms, 1e-9, None)
@@ -183,41 +217,52 @@ class SentenceEncoder:
         # ── SVD decomposition (Stage 5) ─────────────────────
         k = min(self.dim, vocab_size, self.n_docs)
         try:
-            # Use randomized SVD for large matrices to avoid LAPACK gesdd failures
-            # (gesdd can fail with "init_gesdd failed init" on large matrices)
+            # Use sparse SVD for large matrices to avoid LAPACK gesdd failures
             if self.n_docs * vocab_size > 5_000_000:
                 from scipy.sparse.linalg import svds
                 from scipy.sparse import csr_matrix
                 sparse_tfidf = csr_matrix(tfidf)
                 k_svd = min(k, min(sparse_tfidf.shape) - 1)
                 U, S, Vt = svds(sparse_tfidf, k=k_svd)
-                # svds returns smallest singular values first, reverse for largest
                 idx = np.argsort(-S)
                 S = S[idx]
                 Vt = Vt[idx]
             else:
                 U, S, Vt = np.linalg.svd(tfidf, full_matrices=False)
-            self.components = Vt[:k].astype(np.float32)
+            self.components = Vt[:k].astype(np.float32)  # (k, vocab_size)
 
-            # ── Dense Projection (Stage 7) ──────────────────
+            # ── Dense Projection (Stage 7) — full (k → dim) matrix ──
+            # Previous: diagonal scaling only (can't rotate the space).
+            # Now: full Xavier-initialised weight matrix (k, dim).
+            # Initialised from SVD singular value scaling so the first
+            # training step starts close to the right solution.
             S_k = S[:k].astype(np.float32)
-            # Softmax-normalised importance weights
             s_exp = np.exp(S_k - S_k.max())
-            s_weights = s_exp / s_exp.sum()
-            # Dense projection: scale each SVD dimension by its importance
-            self.dense_weight = np.diag(s_weights).astype(np.float32)  # (k, k)
-            self.dense_bias = np.zeros(k, dtype=np.float32)
+            s_weights = s_exp / s_exp.sum()  # softmax importance per dimension
+
+            # Full projection: (k, dim) — maps SVD space to output space
+            # Initialised as scaled identity-like block + small noise for symmetry breaking
+            rng = np.random.default_rng(42)
+            w_init = np.zeros((k, self.dim), dtype=np.float32)
+            min_dim = min(k, self.dim)
+            # Fill diagonal block with singular-value importance weights
+            for d in range(min_dim):
+                w_init[d, d] = s_weights[d] if d < len(s_weights) else 0.0
+            # Small noise on off-diagonal to break symmetry and allow rotation
+            noise = rng.standard_normal((k, self.dim)).astype(np.float32) * 0.01
+            self.dense_weight = w_init + noise  # (k, dim)
+            self.dense_bias = np.zeros(self.dim, dtype=np.float32)
 
         except Exception as e:
             logger.warning(f"SVD failed ({e}) — using truncated identity projection")
             self.components = np.eye(k, vocab_size, dtype=np.float32)
-            self.dense_weight = np.eye(k, dtype=np.float32)
-            self.dense_bias = np.zeros(k, dtype=np.float32)
+            self.dense_weight = np.eye(k, self.dim, dtype=np.float32)
+            self.dense_bias = np.zeros(self.dim, dtype=np.float32)
 
         self._fitted = True
         logger.info(
-            f"SentenceEncoder fitted: {k} semantic dimensions, "
-            f"{vocab_size} vocabulary size, dense projection enabled"
+            f"SentenceEncoder fitted: {k} semantic dims, {vocab_size} vocab, "
+            f"BM25(k1={bm25_k1}, b={bm25_b}), full dense projection ({k}→{self.dim})"
         )
 
     # ── encode() = "inference" ──────────────────────────────
@@ -244,7 +289,7 @@ class SentenceEncoder:
             return self._encode_fallback(texts)
 
     def _encode_fitted(self, texts: list[str], mode: str = "query") -> np.ndarray:
-        """Full pipeline: prefix → tokenize → TF-IDF → SVD → Dense → L2 norm."""
+        """Full pipeline: prefix → tokenize → BM25 → SVD → Dense(k→dim) → L2 norm."""
         n = len(texts)
         vocab_size = len(self.vocab)
 
@@ -260,18 +305,31 @@ class SentenceEncoder:
         else:
             idf_scale = 1.0
 
-        # ── Tokenize + TF-IDF (Stage 2 + 4) ────────────────
+        # ── BM25 term scoring (Stage 2 + 4) ─────────────────
+        # At inference, use query-optimised BM25 (no length normalisation for
+        # short queries since avgdl is calibrated to document length).
+        from app.config import get_settings as _gs2
+        _s2 = _gs2()
+        bm25_k1: float = getattr(_s2, "BM25_K1", 1.5)
+        bm25_b:  float = getattr(_s2, "BM25_B",  0.75)
+        avgdl = getattr(self, "_avgdl", 50.0)
+
         tfidf = np.zeros((n, vocab_size), dtype=np.float32)
         for i, text in enumerate(prefixed):
             tokens = _tokenize(text)
             tf = Counter(tokens)
+            dl = len(tokens)
+            # Queries are typically short — use b=0 for them (no length penalty)
+            b_eff = 0.0 if mode == "query" else bm25_b
+            norm_factor = 1.0 - b_eff + b_eff * dl / max(avgdl, 1.0)
             for token, count in tf.items():
                 if token in self.vocab:
                     j = self.vocab[token]
-                    idf_val = self.idf[j] ** idf_scale
-                    tfidf[i, j] = (1.0 + math.log(max(count, 1))) * idf_val
+                    tf_bm25 = (count * (bm25_k1 + 1.0)) / (count + bm25_k1 * norm_factor)
+                    idf_val = float(self.idf[j]) ** idf_scale
+                    tfidf[i, j] = tf_bm25 * idf_val
 
-        # Row-normalize TF-IDF
+        # Row-normalize
         norms = np.linalg.norm(tfidf, axis=1, keepdims=True)
         norms = np.clip(norms, 1e-9, None)
         tfidf = tfidf / norms
@@ -279,17 +337,17 @@ class SentenceEncoder:
         # ── SVD projection (Stage 5) ────────────────────────
         projected = tfidf @ self.components.T  # (n, k)
 
-        # ── Dense projection (Stage 7) ──────────────────────
-        # Apply learned importance weighting + Tanh activation
-        k = projected.shape[1]
+        # ── Dense projection (Stage 7) — full (k → dim) matrix ──
+        # dense_weight is now (k, dim), mapping SVD space to output space.
+        # Tanh activation like a real Sentence Transformers dense layer.
         if self.dense_weight is not None:
-            w = self.dense_weight[:k, :k]
-            b = self.dense_bias[:k] if self.dense_bias is not None else 0
-            projected = np.tanh(projected @ w + b)  # Tanh like real ST Dense layer
-
-        # Zero-pad to target dim if SVD gave fewer dimensions
-        if k < self.dim:
-            padding = np.zeros((n, self.dim - k), dtype=np.float32)
+            k = projected.shape[1]
+            w = self.dense_weight[:k, :self.dim]   # safe slice for mismatched shapes
+            b = self.dense_bias[:self.dim] if self.dense_bias is not None else 0
+            projected = np.tanh(projected @ w + b)  # (n, dim)
+        elif projected.shape[1] < self.dim:
+            # Fallback: zero-pad if no weight matrix
+            padding = np.zeros((n, self.dim - projected.shape[1]), dtype=np.float32)
             projected = np.hstack([projected, padding])
 
         # ── Neural refinement (Stage 9/12) ──────────────────
@@ -330,44 +388,108 @@ class SentenceEncoder:
 
     # ── Persistence: save/load weights to disk ──────────────────
 
-    def save_weights(self, path: str):
-        """Save all learned weights to a .npz file."""
-        if not self._fitted:
-            raise RuntimeError("Cannot save unfitted encoder")
-        data = {
-            "dim": np.array([self.dim]),
-            "n_docs": np.array([self.n_docs]),
-            "idf": self.idf,
-            "components": self.components,
-        }
-        # vocab stored as JSON string inside the npz
+    # ── Serialisation helpers (shared by file and DB paths) ──────
+
+    def _to_bytes(self) -> bytes:
+        """Serialise weights to an in-memory .npz byte buffer."""
+        import io
         import json as _json
-        data["vocab_json"] = np.array([_json.dumps(self.vocab)])
+        data = {
+            "dim":        np.array([self.dim]),
+            "n_docs":     np.array([self.n_docs]),
+            "avgdl":      np.array([getattr(self, "_avgdl", 50.0)]),
+            "idf":        self.idf,
+            "components": self.components,
+            "vocab_json": np.array([_json.dumps(self.vocab)]),
+        }
         if self.dense_weight is not None:
             data["dense_weight"] = self.dense_weight
         if self.dense_bias is not None:
             data["dense_bias"] = self.dense_bias
-        np.savez_compressed(path, **data)
-        logger.info(f"Encoder weights saved to {path}")
+        buf = io.BytesIO()
+        np.savez_compressed(buf, **data)
+        return buf.getvalue()
 
-    def load_weights(self, path: str):
-        """Load weights from a .npz file. Marks encoder as fitted."""
+    def _from_bytes(self, raw: bytes) -> None:
+        """Deserialise weights from a .npz byte buffer. Marks encoder as fitted."""
+        import io
         import json as _json
-        data = np.load(path, allow_pickle=False)
+        data = np.load(io.BytesIO(raw), allow_pickle=False)
         self.dim = int(data["dim"][0])
         self.n_docs = int(data["n_docs"][0])
+        self._avgdl = float(data["avgdl"][0]) if "avgdl" in data else 50.0
         self.idf = data["idf"]
         self.components = data["components"]
         self.vocab = _json.loads(str(data["vocab_json"][0]))
-        self.dense_weight = data.get("dense_weight")
-        self.dense_bias = data.get("dense_bias")
-        # np.load returns None-like for missing keys; handle gracefully
+        self.dense_weight = data["dense_weight"] if "dense_weight" in data else None
+        self.dense_bias   = data["dense_bias"]   if "dense_bias"   in data else None
         if self.dense_weight is not None and not isinstance(self.dense_weight, np.ndarray):
             self.dense_weight = None
         if self.dense_bias is not None and not isinstance(self.dense_bias, np.ndarray):
             self.dense_bias = None
         self._fitted = True
-        logger.info(f"Encoder weights loaded from {path} (dim={self.dim}, vocab={len(self.vocab)}, docs={self.n_docs})")
+
+    # ── File-based persistence (local dev / fallback) ─────────────
+
+    def save_weights(self, path: str) -> None:
+        """Save weights to a .npz file."""
+        if not self._fitted:
+            raise RuntimeError("Cannot save unfitted encoder")
+        with open(path, "wb") as f:
+            f.write(self._to_bytes())
+        logger.info(f"Encoder weights saved to {path}")
+
+    def load_weights(self, path: str) -> None:
+        """Load weights from a .npz file."""
+        with open(path, "rb") as f:
+            self._from_bytes(f.read())
+        logger.info(
+            f"Encoder weights loaded from {path} "
+            f"(dim={self.dim}, vocab={len(self.vocab)}, docs={self.n_docs}, "
+            f"avgdl={self._avgdl:.1f})"
+        )
+
+    # ── PostgreSQL persistence ────────────────────────────────────
+
+    async def save_to_db(self, pool, schema: str, schema_hash: str = "") -> None:
+        """Persist weights into {schema}.model_weights (upsert by model_name)."""
+        if not self._fitted:
+            raise RuntimeError("Cannot save unfitted encoder")
+        raw = self._to_bytes()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""INSERT INTO {schema}.model_weights
+                        (model_name, weight_data, schema_hash)
+                    VALUES ('encoder', $1, $2)
+                    ON CONFLICT (model_name) DO UPDATE
+                        SET weight_data  = EXCLUDED.weight_data,
+                            schema_hash  = EXCLUDED.schema_hash,
+                            updated_at   = NOW()""",
+                raw, schema_hash,
+            )
+        logger.info(
+            f"Encoder weights saved to {schema}.model_weights "
+            f"({len(raw) // 1024} KB, hash={schema_hash[:8]})"
+        )
+
+    async def load_from_db(self, pool, schema: str) -> str | None:
+        """Load weights from {schema}.model_weights.
+        Returns the stored schema_hash so the caller can compare, or None if absent."""
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT weight_data, schema_hash FROM {schema}.model_weights "
+                f"WHERE model_name = 'encoder'"
+            )
+        if not row:
+            return None
+        self._from_bytes(bytes(row["weight_data"]))
+        stored_hash = row["schema_hash"] or ""
+        logger.info(
+            f"Encoder weights loaded from {schema}.model_weights "
+            f"(dim={self.dim}, vocab={len(self.vocab)}, docs={self.n_docs}, "
+            f"avgdl={self._avgdl:.1f}, hash={stored_hash[:8]})"
+        )
+        return stored_hash
 
 
 # ── Global singleton ────────────────────────────────────────────

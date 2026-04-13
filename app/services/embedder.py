@@ -12,6 +12,7 @@ the Sentence Transformers pipeline entirely in Python + numpy:
 
 No fastembed, no sentence-transformers, no Ollama embeddings API.
 """
+import asyncio
 import logging
 from app.config import get_settings
 
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 async def embed_texts(texts: list[str], mode: str = "query") -> list[list[float]]:
     """Embed a batch of texts using the local SentenceEncoder.
+
+    Runs the synchronous numpy/SVD encoder in a thread executor so it doesn't
+    block the asyncio event loop while embedding many chunks (e.g. file uploads).
 
     Args:
         texts: input strings
@@ -33,7 +37,7 @@ async def embed_texts(texts: list[str], mode: str = "query") -> list[list[float]
         return []
 
     from app.services.sentence_encoder import encode_texts
-    return encode_texts(texts, mode=mode)
+    return await asyncio.to_thread(encode_texts, texts, mode=mode)
 
 
 async def embed_single(text: str, mode: str = "query") -> list[float]:
